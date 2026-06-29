@@ -248,7 +248,20 @@ def display_limiting_current_runs(bundles):
 
 
 # --- Main App ---
-# st.title("ElectroSmart")
+st.set_page_config(
+    page_title="ElectroSmart",
+    page_icon="Logo.png",
+    menu_items={
+        "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
+        "About": ("ElectroSmart v4.2 — Balsara Lab, UC Berkeley\n\n"
+                  "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
+                  "**Acknowledgements & Credits:** \n - If this software contributes to any " 
+                  "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
+                  "**References:**\n - Limiting Current: Zach J. Hoffman *et al* 2023 *J. Electrochem. Soc.* **170** 120524 \n"
+                  "- Current Fraction/Diffusion Coefficient: Zach J. Hoffman *et al* 2021 *Solid State Ionics* **370** 115751")
+    }
+)
+
 st.markdown("""
     <style>
     .tooltip {
@@ -295,42 +308,6 @@ st.markdown("""
         margin: 0;
     }
     </style>
-    
-    <div class="title-container">
-        <h1 class="main-title">ElectroSmart</h1>
-        <div class="tooltip"> ℹ️
-            <span class="tooltiptext">
-                <strong>About:</strong><br><br>
-                • An interface/app for electrochemical data analysis. <br>
-                • Methods include EIS fits,
-                  Sand's time analysis, current fraction analysis,
-                  and diffusion coefficient fitting.
-            </span>
-        </div>
-        <div class="tooltip"> ©️
-            <span class="tooltiptext">
-                <strong>Acknowledgements & Credits</strong><br><br>
-                If this software contributes to any publications
-                outside the Balsara Lab, please acknowledge the Balsara Lab,
-                University of California, Berkeley.
-            </span>
-        </div>
-        <div class="tooltip"> 📞
-            <span class="tooltiptext">
-                <strong>Contact Information</strong><br><br>
-                • <b>Hansen Yang</b>: hansenry [at] berkeley [dot] edu<br>
-                • <b>Zirong He</b>: zironghe [at] berkeley [dot] edu<br>
-            </span>
-        </div>
-        <div class="tooltip"> 📚
-            <span class="tooltiptext">
-                <strong>References</strong><br><br>
-                • <b>Limiting Current</b>: Zach J. Hoffman <i>et al</i> 2023 <i>J. Electrochem. Soc.</i> <b>170</b> 120524<br>
-                • <b>Current Fraction/Diffusion Coefficient</b>: Zach J. Hoffman <i>et al</i> 2021 <i>Solid State Ionics</i> <b>370</b> 115751<br>
-            </span>
-        </div>
-            </div>
-    </div>
 """, unsafe_allow_html=True)
 
 st.markdown(
@@ -366,6 +343,8 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+st.title("ElectroSmart")
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
