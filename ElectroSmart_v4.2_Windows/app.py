@@ -346,6 +346,8 @@ st.markdown(
 
 st.title("ElectroSmart")
 
+st.caption("*Check the ⋮ menu (top right) for app info and acknowledgements.*")
+
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 col_a, col_b = st.columns(2)
