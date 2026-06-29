@@ -1,9 +1,12 @@
 import streamlit as st
 import io
+import os
 import zipfile
 import pandas as pd
 import matplotlib.pyplot as plt
 from galvani import BioLogic
+from PIL import Image
+import base64
 
 from plotting import (
     plot_all_EIS_precond,
@@ -18,6 +21,10 @@ from plotting import (
     analyze_diffusion_coefficient,
 )
 
+logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
+icon = Image.open(logo_path)
+with open(logo_path, "rb") as f:
+    logo_b64 = base64.b64encode(f.read()).decode()
 
 # --- Helper Functions ---
 def get_discard_parameters():
@@ -250,7 +257,7 @@ def display_limiting_current_runs(bundles):
 # --- Main App ---
 st.set_page_config(
     page_title="ElectroSmart",
-    page_icon="Logo.png",
+    page_icon=icon,
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
         "About": ("ElectroSmart v4.2 — Balsara Lab, UC Berkeley\n\n"
@@ -344,7 +351,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("ElectroSmart")
+st.markdown(
+    f"""
+    <div style="display:flex; align-items:flex-end; gap:12px;">
+        <img src="data:image/png;base64,{logo_b64}" style="height:48px; margin-bottom:4px;">
+        <h1 style="margin:0; padding:0;">ElectroSmart</h1>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.caption("*Check the ⋮ menu (top right) for app info and acknowledgements.*")
 
