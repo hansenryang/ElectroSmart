@@ -155,10 +155,15 @@ def fit_current_fraction_eis_resistances(
     return resistances, pd.concat(fit_tables, ignore_index=True)
 
 
-def build_preconditioning_analysis_zip(cell_label):
+def build_eis_analysis_zip(key_list):
+    """Bundle EIS overview + semi-ellipse fit outputs for the given keys into a ZIP.
+
+    Used by both the single-file EIS view (key_list=["Single"]) and the
+    Preconditioning view (key_list=["Positive", "Negative"]).
+    """
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
-        for key in ["Positive", "Negative"]:
+        for key in key_list:
             plot_key = f"data_{key}"
             if plot_key in st.session_state:
                 zf.writestr(
@@ -179,6 +184,104 @@ def build_preconditioning_analysis_zip(cell_label):
                     zf.writestr(f"{key}_{fname}", buf.getvalue())
 
     return zip_buf.getvalue()
+
+
+def run_eis_analysis(
+    cell_type, cell_label, mpr_files, selections, discard_left, discard_right, fit_choice
+):
+    """Generate the EIS overview plot and semi-ellipse fit for each selected file,
+    storing results in session_state keyed by the labels in `selections`
+    (e.g. {"Single": fname} or {"Positive": fname, "Negative": fname}).
+    """
+    for key, fname in selections.items():
+        f_obj = next(f for f in mpr_files if f.name == fname)
+
+        img_buf = plot_all_EIS_precond(cell_type, cell_label, f_obj, key)
+        st.session_state[f"data_{key}"] = img_buf
+        st.session_state[f"fname_{key}"] = f"{cell_label}_{key}_Plot.png"
+
+        df, sum_fig, csv_data, cyc_imgs = semiellipse_fit(
+            cell_type,
+            cell_label,
+            discard_left,
+            discard_right,
+            f_obj,
+            key,
+            fit_choice == "Two Ellipse (Recommended)",
+            fit_choice == "Single Ellipse",
+        )
+        st.session_state[f"fit_df_{key}"] = df
+        st.session_state[f"fit_fig_{key}"] = sum_fig
+        st.session_state[f"fit_csv_{key}"] = csv_data
+        st.session_state[f"fit_cycles_{key}"] = cyc_imgs
+
+
+def display_eis_analysis(keys, cell_label, zip_key):
+    """Render the persistent EIS overview + semi-ellipse fit results for `keys`.
+
+    `keys` is ["Single"] for the single-file view or ["Positive", "Negative"]
+    for Preconditioning; the layout adapts to however many keys are passed.
+    """
+    has_cycle_plots = all(f"data_{key}" in st.session_state for key in keys)
+    has_fit_data = any(f"fit_df_{key}" in st.session_state for key in keys)
+
+    if not (has_cycle_plots or has_fit_data):
+        return
+
+    st.download_button(
+        "📦 Download All EIS Analysis Files (ZIP)",
+        st.session_state[zip_key],
+        f"{cell_label}_Full_Analysis.zip",
+        "application/zip",
+        width="stretch",
+    )
+
+    if has_cycle_plots:
+        cols = st.columns(len(keys))
+        for col, key in zip(cols, keys):
+            with col:
+                st.subheader(f"{key} PEIS")
+                st.image(st.session_state[f"data_{key}"])
+                st.download_button(
+                    f"Download {key} PNG",
+                    st.session_state[f"data_{key}"],
+                    st.session_state[f"fname_{key}"],
+                    "image/png",
+                    key=f"btn_{key}",
+                )
+
+    st.divider()
+
+    if has_fit_data:
+        cols = st.columns(len(keys))
+        for col, key in zip(cols, keys):
+            with col:
+                if f"fit_df_{key}" not in st.session_state:
+                    continue
+                st.subheader(f"{key} Fit")
+                st.image(st.session_state[f"fit_fig_{key}"])
+
+                c_dl1, c_dl2 = st.columns(2)
+                c_dl1.download_button(
+                    f"CSV ({key})",
+                    st.session_state[f"fit_csv_{key}"].getvalue(),
+                    f"{key}_data.csv",
+                )
+                c_dl2.download_button(
+                    f"Trend ({key})",
+                    st.session_state[f"fit_fig_{key}"].getvalue(),
+                    f"{key}_trend.png",
+                )
+
+                with st.expander(f"Individual Cycle Plots ({key})"):
+                    for fname, img_buf in st.session_state[f"fit_cycles_{key}"]:
+                        st.image(img_buf, caption=fname)
+                        st.download_button(
+                            f"Download {fname}",
+                            img_buf.getvalue(),
+                            f"{key}_{fname}",
+                            key=f"btn_{key}_{fname}",
+                        )
 
 
 def build_limiting_impedance_zip(cell_label, include_summary=True, include_individual=True):
@@ -425,6 +528,7 @@ if cell_type and cell_label and uploaded_files:
     analysis_type = st.radio(
         "Analysis:",
         [
+            "EIS Fit (Single File)",
             "Preconditioning",
             "Limiting Current",
             "Current Fraction",
@@ -432,6 +536,52 @@ if cell_type and cell_label and uploaded_files:
         ],
         horizontal=True,
     )
+
+    if analysis_type == "EIS Fit (Single File)":
+        if not mpr_files:
+            st.warning("Please upload .mpr files for EIS analysis.")
+            st.stop()
+
+        peis_files = [f for f in mpr_files if "PEIS" in f.name]
+        if not peis_files:
+            st.warning("No PEIS files detected. Please upload at least one PEIS .mpr file.")
+            st.stop()
+
+        peis_file_names = [f.name for f in peis_files]
+
+        st.write("#### Identify PEIS File")
+        single_peis_name = st.selectbox("PEIS file", peis_file_names, key="single_peis")
+
+        selections = {"Single": single_peis_name}
+
+        st.divider()
+
+        tech = impedance_technique_radio("single_impedance_technique")
+
+        if tech == "Linear fit":
+            st.warning("This technique is not yet supported.")
+
+        if tech == "Semi-ellipse fit":
+            discard_left, discard_right = get_discard_parameters()
+            fit_choice = single_or_dual_ellipse("single_fit_choice")
+
+            if st.button("Generate EIS Plots", key="single_generate_button"):
+                with st.spinner(
+                    f"Analyzing PEIS for {cell_label}... This may take a moment."
+                ):
+                    run_eis_analysis(
+                        cell_type,
+                        cell_label,
+                        mpr_files,
+                        selections,
+                        discard_left,
+                        discard_right,
+                        fit_choice,
+                    )
+                    st.session_state["fit_zip_single"] = build_eis_analysis_zip(["Single"])
+                    st.toast("EIS analysis complete!", icon="✅")
+
+            display_eis_analysis(["Single"], cell_label, "fit_zip_single")
 
     if analysis_type == "Preconditioning":
         if not mpr_files:
@@ -474,115 +624,25 @@ if cell_type and cell_label and uploaded_files:
                 discard_left, discard_right = get_discard_parameters()
                 fit_choice = single_or_dual_ellipse("preconditioning_fit_choice")
 
-                if st.button("Generate EIS Plots"):
-
+                if st.button("Generate EIS Plots", key="precond_generate_button"):
                     with st.spinner(
                         f"Analyzing Positive and Negative PEIS for {cell_label}... This may take a moment."
                     ):
-                        for key in ["Positive", "Negative"]:
-                            f_obj = next(
-                                f for f in mpr_files if f.name == selections[key]
-                            )
-                            img_buf = plot_all_EIS_precond(
-                                cell_type, cell_label, f_obj, key
-                            )
-                            st.session_state[f"data_{key}"] = img_buf
-                            st.session_state[f"fname_{key}"] = (
-                                f"{cell_label}_{key}_Plot.png"
-                            )
-
-                            df, sum_fig, csv_data, cyc_imgs = semiellipse_fit(
-                                cell_type,
-                                cell_label,
-                                discard_left,
-                                discard_right,
-                                f_obj,
-                                key,
-                                fit_choice == "Two Ellipse (Recommended)",
-                                fit_choice == "Single Ellipse",
-                            )
-
-                            st.session_state[f"fit_df_{key}"] = df
-                            st.session_state[f"fit_fig_{key}"] = sum_fig
-                            st.session_state[f"fit_csv_{key}"] = csv_data
-                            st.session_state[f"fit_cycles_{key}"] = cyc_imgs
-
-                        st.session_state["precond_zip"] = build_preconditioning_analysis_zip(cell_label)
+                        run_eis_analysis(
+                            cell_type,
+                            cell_label,
+                            mpr_files,
+                            selections,
+                            discard_left,
+                            discard_right,
+                            fit_choice,
+                        )
+                        st.session_state["fit_zip_precond"] = build_eis_analysis_zip(
+                            ["Positive", "Negative"]
+                        )
                         st.toast("EIS analysis complete!", icon="✅")
 
-                # --- PERSISTENT DISPLAY AREA ---
-
-                has_cycle_plots = (
-                    "data_Positive" in st.session_state
-                    and "data_Negative" in st.session_state
-                )
-                has_fit_data = (
-                    "fit_df_Positive" in st.session_state
-                    or "fit_df_Negative" in st.session_state
-                )
-
-                if has_cycle_plots or has_fit_data:
-
-                    st.download_button(
-                        "📦 Download All EIS Analysis Files (ZIP)",
-                        st.session_state["precond_zip"],
-                        f"{cell_label}_Full_Analysis.zip",
-                        "application/zip",
-                        width="stretch",
-                    )
-
-                if has_cycle_plots:
-                    c1, c2 = st.columns(2)
-
-                    for i, key in enumerate(["Positive", "Negative"]):
-                        with [c1, c2][i]:
-                            st.subheader(f"{key} PEIS")
-                            st.image(st.session_state[f"data_{key}"])
-                            st.download_button(
-                                f"Download {key} PNG",
-                                st.session_state[f"data_{key}"],
-                                st.session_state[f"fname_{key}"],
-                                "image/png",
-                                key=f"btn_{key}",
-                            )
-
-                st.divider()
-
-                # --- PERSISTENT DISPLAY ---
-
-                if has_fit_data:
-                    col1, col2 = st.columns(2)
-                    for i, key in enumerate(["Positive", "Negative"]):
-                        with [col1, col2][i]:
-                            if f"fit_df_{key}" in st.session_state:
-                                st.subheader(f"{key} Fit")
-                                st.image(st.session_state[f"fit_fig_{key}"])
-
-                                # Individual Summary Downloads
-                                c_dl1, c_dl2 = st.columns(2)
-                                c_dl1.download_button(
-                                    f"CSV ({key})",
-                                    st.session_state[f"fit_csv_{key}"].getvalue(),
-                                    f"{key}_data.csv",
-                                )
-                                c_dl2.download_button(
-                                    f"Trend ({key})",
-                                    st.session_state[f"fit_fig_{key}"].getvalue(),
-                                    f"{key}_trend.png",
-                                )
-
-                                # Expandable Individual Cycles
-                                with st.expander(f"Individual Cycle Plots ({key})"):
-                                    for fname, img_buf in st.session_state[
-                                        f"fit_cycles_{key}"
-                                    ]:
-                                        st.image(img_buf, caption=fname)
-                                        st.download_button(
-                                            f"Download {fname}",
-                                            img_buf.getvalue(),
-                                            f"{key}_{fname}",
-                                            key=f"btn_{key}_{fname}",
-                                        )
+                display_eis_analysis(["Positive", "Negative"], cell_label, "fit_zip_precond")
 
     if analysis_type == "Limiting Current":
         if not mpr_files:

@@ -5,34 +5,41 @@ echo ElectroSmart Launcher
 echo ================================
 :: Always move to BAT directory
 cd /d "%~dp0"
-
 echo.
-echo [1/4] Verifying Python path...
-where python
+echo [1/6] Checking virtual environment...
+:: Create venv if missing
+if not exist "ElectroSmartEnv\Scripts\python.exe" (
+    echo Virtual environment not found. Creating...
+    python -m venv ElectroSmartEnv
+    if errorlevel 1 (
+        echo ERROR: Failed to create virtual environment.
+        pause
+        exit /b 1
+    )
+)
+echo.
+echo [2/6] Activating environment...
+call "ElectroSmartEnv\Scripts\activate.bat"
 if errorlevel 1 (
-    echo ERROR: Python was not found.
-    echo Please install Python and make sure it is available from Command Prompt.
+    echo ERROR: Failed to activate virtual environment.
     pause
     exit /b 1
 )
-
 echo.
-echo [2/4] Installing/updating dependencies...
-python -m pip install --upgrade pip
+echo [3/6] Verifying Python path...
+where python
+echo.
+echo [4/6] Installing/updating dependencies...
+set "PY=%~dp0ElectroSmartEnv\Scripts\python.exe"
+"%PY%" -m pip install --upgrade pip
 if exist "requirements.txt" (
-    python -m pip install -r requirements.txt
+    "%PY%" -m pip install -r requirements.txt
 ) else (
     echo WARNING: requirements.txt not found
-    python -m pip install streamlit pandas numpy matplotlib scipy galvani openpyxl
+    "%PY%" -m pip install streamlit pandas numpy matplotlib scipy galvani
 )
-if errorlevel 1 (
-    echo ERROR: Dependency installation failed.
-    pause
-    exit /b 1
-)
-
 echo.
-echo [3/4] Shortcut setup...
+echo [5/6] Shortcut setup...
 set "SHORTCUT_PATH=%USERPROFILE%\Desktop\ElectroSmart.lnk"
 set "TARGET_PATH=%~dp0ElectroSmart.bat"
 set "ICON_PATH=%~dp0Logo.ico"
@@ -47,10 +54,9 @@ if not exist "%SHORTCUT_PATH%" (
 ) else (
     echo Shortcut already exists.
 )
-
 echo.
-echo [4/4] Launching Streamlit app...
-python -m streamlit run app.py --server.port 8501
+echo [6/6] Launching Streamlit app...
+"%PY%" -m streamlit run app.py
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo Streamlit exited with code %EXIT_CODE%

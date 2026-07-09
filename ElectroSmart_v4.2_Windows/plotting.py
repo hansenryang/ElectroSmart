@@ -220,7 +220,7 @@ def semiellipse_fit(
         )
         lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
         plt.plot(x_plot, y_p, "r-", label=lbl)
-        plt.title(f"{cell_label} {run_label}")
+        plt.title(f"{cell_label} {run_label} Cycle {int(c)}")
         plt.xlabel("Re(Z)/Ohm")
         plt.ylabel("-Im(Z)/Ohm")
         plt.gca().set_aspect("equal")
