@@ -2,20 +2,24 @@
 ElectroSmart is an interface/app made for data analysis work in the Balsara Lab at UC Berkeley. It supports the following electrochemical data analysis: preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.
 
 Authors: Hansen Yang, Zirong He    
-Last updated: June 28, 2026  
-Version: 4.2 (v4.2)  
+Last updated: July 8, 2026  
+Version: 4.3 (v4.3)  
 Properties: This app is run locally on your computer. It is displayed in your default browser.
 
 ## Changes From v3 to v4
 
-1. Added Current Fraction analysis.
+1. Added generic EIS analysis.
+   - Allows analysis of single `.mpr` EIS files.
+   - Uses single/double ellipse fitting, similar to preconditioning analysis.
+
+2. Added Current Fraction analysis.
    - Uses `.mpr` CA/OCV files instead of `.txt` files.
    - Keeps the existing `03/04` and `09/10` file numbering convention.
    - Uses positive and negative PEIS/EIS `.mpr` files to fit `R_bulk` and `R_i`.
    - Uses the first fitted EIS cycle as the initial resistance and the last fitted EIS cycle as the steady-state resistance.
    - Exports summary CSV, Excel, plot PNG, EIS fit table, and ZIP bundle.
 
-2. Added Diffusion Coefficient fitting.
+3. Added Diffusion Coefficient fitting.
    - Fits OCV relaxation data with $V(t) = A e^{-kt} + C$.
    - Calculates $D = k L^2 / \pi^2$.
    - User inputs thickness in `um`, cutoff time in `h`, and alpha.
@@ -25,13 +29,13 @@ Properties: This app is run locally on your computer. It is displayed in your de
    - Reports $D$ `(cm^2/s)` in scientific notation.
    - Plots OCV fit and $\log(|V(t) - V_\infty| / \text{mV})$ vs time for sanity check, reliable D comes from the linear regime.
 
-3. Added cross-platform launchers.
+4. Added cross-platform launchers.
    - Windows users can run `ElectroSmart.bat`.
    - macOS users can run `ElectroSmart_v4_macOS.command` in the macOS package.
 
-4. Added `openpyxl` to `requirements.txt` for Excel export.
+5. Added `openpyxl` to `requirements.txt` for Excel export.
 
-5. Added three button colors to distinguish functionality: run analysis, download files, and clear files.
+6. Added three button colors to distinguish functionality: run analysis, download files, and clear files.
 
 ## Changes From v2 to v3
 
