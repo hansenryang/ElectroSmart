@@ -5,6 +5,7 @@ import io
 from galvani import BioLogic
 from scipy.optimize import fsolve, fmin, curve_fit
 import re
+from typing import Any, IO, Optional, Union
 
 # Global style updates
 plt.rcParams.update(
@@ -20,7 +21,18 @@ plt.rcParams.update(
 )
 
 
-def get_current_from_mpr(file_obj):
+def get_current_from_mpr(file_obj: IO[bytes]) -> float:
+    """Read the median current from an MPR file.
+
+    Find the current column in the file. Return its median value.
+    If no current column exists, return 0.0.
+
+    Args:
+        file_obj: An MPR file object with a seek method.
+
+    Returns:
+        The median current in mA, or 0.0 if no current column exists.
+    """
     file_obj.seek(0)
     mpr = BioLogic.MPRfile(file_obj)
     df = pd.DataFrame(mpr.data)
@@ -31,7 +43,23 @@ def get_current_from_mpr(file_obj):
     return 0.0
 
 
-def plot_all_EIS_precond(cell_type, cell_label, data_filename, run_label):
+def plot_all_EIS_precond(
+    cell_type: str, cell_label: str, data_filename: IO[bytes], run_label: str
+) -> io.BytesIO:
+    """Plot all PEIS cycles from one MPR file.
+
+    Read the cycles from the file. Plot each cycle as a scatter series
+    on one chart. Save the chart to a PNG buffer.
+
+    Args:
+        cell_type: The type of cell under test.
+        cell_label: The label of the cell under test.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+
+    Returns:
+        A PNG image buffer of the combined cycle plot.
+    """
     data_filename.seek(0)
     mpr = BioLogic.MPRfile(data_filename)
     df = pd.DataFrame(mpr.data)
@@ -60,7 +88,23 @@ def plot_all_EIS_precond(cell_type, cell_label, data_filename, run_label):
     return img_buffer
 
 
-def plot_all_CP_LC(cell_label, elyt_thickness, cp_summaries):
+def plot_all_CP_LC(
+    cell_label: str,
+    elyt_thickness: float,
+    cp_summaries: list[tuple[pd.DataFrame, float]],
+) -> io.BytesIO:
+    """Plot the combined CP curves for a Limiting Current run.
+
+    Plot V/L against time for each current density in the run.
+
+    Args:
+        cell_label: The label of the cell under test.
+        elyt_thickness: The electrolyte thickness, in cm.
+        cp_summaries: A list of (dataframe, current density) pairs.
+
+    Returns:
+        A PNG image buffer of the combined plot.
+    """
     fig_vl, ax_vl = plt.subplots(figsize=(10, 6))
     for df, d in cp_summaries:
         ax_vl.plot(
@@ -87,24 +131,76 @@ def plot_all_CP_LC(cell_label, elyt_thickness, cp_summaries):
     return cp_plot_buf
 
 
-def semi_ellipse(x, xc, yc, Rx, Ry):
+def semi_ellipse(
+    x: np.ndarray, xc: float, yc: float, Rx: float, Ry: float
+) -> np.ndarray:
+    """Compute the upper half of an ellipse at each x value.
+
+    Args:
+        x: The x values to evaluate.
+        xc: The x coordinate of the ellipse center.
+        yc: The y coordinate of the ellipse center.
+        Rx: The x radius of the ellipse.
+        Ry: The y radius of the ellipse.
+
+    Returns:
+        The y values on the upper half of the ellipse.
+    """
     z = (x - xc) / Rx
     return yc + Ry * np.sqrt(np.maximum(1 - z**2, 0))
 
 
-def solve_ellipse_xints(xc, yc, Rx, Ry):
+def solve_ellipse_xints(
+    xc: float, yc: float, Rx: float, Ry: float
+) -> tuple[float, float]:
+    """Find the left and right x-intercepts of an ellipse at y = 0.
+
+    Args:
+        xc: The x coordinate of the ellipse center.
+        yc: The y coordinate of the ellipse center.
+        Rx: The x radius of the ellipse.
+        Ry: The y radius of the ellipse.
+
+    Returns:
+        The left x-intercept and the right x-intercept.
+    """
     term = np.sqrt(abs(1 - (yc / Ry) ** 2))
     return xc - Rx * term, xc + Rx * term
 
 
-def obj_one_ellipse(params, x, y):
+def obj_one_ellipse(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a one-ellipse fit.
+
+    Reject invalid radii with a large penalty value.
+
+    Args:
+        params: The fit parameters xc, yc, Rx, Ry.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors, or 1e12 for invalid radii.
+    """
     xc, yc, Rx, Ry = params
     if Rx <= 0 or Ry <= 0:
         return 1e12
     return np.sum((y - semi_ellipse(x, xc, yc, Rx, Ry)) ** 2)
 
 
-def obj_two_ellipses(params, x, y):
+def obj_two_ellipses(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a two-ellipse fit.
+
+    Take the upper envelope of the two ellipses at each x value. Reject
+    invalid radii with a large penalty value.
+
+    Args:
+        params: The fit parameters for both ellipses.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors, or 1e12 for invalid radii.
+    """
     xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = params
     if any(p <= 0 for p in [Rx1, Ry1, Rx2, Ry2]):
         return 1e12
@@ -113,13 +209,36 @@ def obj_two_ellipses(params, x, y):
     return np.sum((y - np.maximum(y1, y2)) ** 2)
 
 
-def calculate_bic(rss, n, k):
+def calculate_bic(rss: float, n: int, k: int) -> float:
+    """Calculate the Bayesian Information Criterion for a fit.
+
+    Args:
+        rss: The residual sum of squares from the fit.
+        n: The number of data points.
+        k: The number of free parameters in the fit.
+
+    Returns:
+        The BIC value. Return 1e12 if rss is not positive.
+    """
     if rss <= 0:
         return 1e12
     return n * np.log(rss / n) + k * np.log(n)
 
 
-def find_both_mins(df, peak_idx):
+def find_both_mins(df: pd.DataFrame, peak_idx: int) -> tuple[int, int]:
+    """Find the left and right local minimum points around a peak.
+
+    Search left from the peak for the lowest point. Search right from
+    the peak for the lowest point.
+
+    Args:
+        df: A dataframe with the imaginary impedance in column 1.
+        peak_idx: The row index of the peak.
+
+    Returns:
+        The row index of the left minimum and the row index of the
+        right minimum.
+    """
     Im_Z = df.iloc[:, 1].values
     n_rows = len(Im_Z)
     left_min_idx = 0
@@ -138,15 +257,39 @@ def find_both_mins(df, peak_idx):
 
 
 def semiellipse_fit(
-    cell_type,
-    cell_label,
-    no_left_idx_to_throw,
-    no_right_idx_to_throw,
-    data_filename,
-    run_label,
-    must_use_dual,
-    must_use_single,
-):
+    cell_type: str,
+    cell_label: str,
+    no_left_idx_to_throw: int,
+    no_right_idx_to_throw: int,
+    data_filename: IO[bytes],
+    run_label: str,
+    must_use_dual: bool,
+    must_use_single: bool,
+) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
+    """Fit each PEIS cycle in an MPR file with one or two semi-ellipses.
+
+    For each cycle, trim points near the ends. Fit a single ellipse and
+    a two-ellipse model. Choose the model with the lower BIC score,
+    unless the caller forces one model. Compute R_bulk and R_i from the
+    fit. Plot each cycle fit and the trend across cycles.
+
+    Args:
+        cell_type: The type of analysis, for example "Preconditioning".
+        cell_label: The label of the cell under test.
+        no_left_idx_to_throw: The number of points to discard from the
+            left.
+        no_right_idx_to_throw: The number of points to discard from the
+            right.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+        must_use_dual: Force the two-ellipse model for every cycle.
+        must_use_single: Force the one-ellipse model for every cycle.
+
+    Returns:
+        A tuple with the summary dataframe, the trend plot buffer, the
+        summary CSV buffer, and a list of (file name, image buffer)
+        pairs for each cycle.
+    """
     data_filename.seek(0)
     mpr = BioLogic.MPRfile(data_filename)
     df_raw = pd.DataFrame(mpr.data)
@@ -220,7 +363,7 @@ def semiellipse_fit(
         )
         lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
         plt.plot(x_plot, y_p, "r-", label=lbl)
-        plt.title(f"{cell_label} {run_label}")
+        plt.title(f"{cell_label} {run_label} Cycle {int(c)}")
         plt.xlabel("Re(Z)/Ohm")
         plt.ylabel("-Im(Z)/Ohm")
         plt.gca().set_aspect("equal")
@@ -262,7 +405,20 @@ def semiellipse_fit(
     return summary_df, sum_buf, csv_buf, cycle_images
 
 
-def plot_cp_ewe(f_obj, cell_label, density):
+def plot_cp_ewe(
+    f_obj: IO[bytes], cell_label: str, density: float
+) -> tuple[io.BytesIO, pd.DataFrame]:
+    """Plot cell voltage against time for one CP file.
+
+    Args:
+        f_obj: An MPR file object that contains CP data.
+        cell_label: The label of the cell under test.
+        density: The applied current density, in mA/cm².
+
+    Returns:
+        A PNG image buffer of the plot, and the dataframe with a
+        normalized time column in hours.
+    """
     f_obj.seek(0)
     mpr = BioLogic.MPRfile(f_obj)
     df = pd.DataFrame(mpr.data)
@@ -285,14 +441,31 @@ def plot_cp_ewe(f_obj, cell_label, density):
 
 
 def plot_limiting_peis_fit(
-    f_peis,
-    cell_label,
-    run_label,
-    discard_left,
-    discard_right,
-    must_use_dual,
-    must_use_single,
-):
+    f_peis: IO[bytes],
+    cell_label: str,
+    run_label: str,
+    discard_left: int,
+    discard_right: int,
+    must_use_dual: bool,
+    must_use_single: bool,
+) -> tuple[Optional[io.BytesIO], pd.DataFrame, io.StringIO]:
+    """Fit the PEIS data for one Limiting Current run.
+
+    Call semiellipse_fit and return the first cycle image.
+
+    Args:
+        f_peis: An MPR file object that contains PEIS data.
+        cell_label: The label of the cell under test.
+        run_label: The label for this run, for example "Run 1".
+        discard_left: The number of points to discard from the left.
+        discard_right: The number of points to discard from the right.
+        must_use_dual: Force the two-ellipse model for every cycle.
+        must_use_single: Force the one-ellipse model for every cycle.
+
+    Returns:
+        The first cycle image buffer, or None if no cycle exists. Also
+        return the summary dataframe and the summary CSV buffer.
+    """
     summary_df, sum_buf, csv_buf, cycle_imgs = semiellipse_fit(
         "Limiting",
         cell_label,
@@ -308,7 +481,23 @@ def plot_limiting_peis_fit(
     return None, summary_df, csv_buf
 
 
-def analyze_sand_and_polarization(cp_results):
+def analyze_sand_and_polarization(
+    cp_results: list[tuple[pd.DataFrame, float]]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Find the Sand's time and the steady-state polarization for each run.
+
+    Find the highest voltage across all runs. For each run that reaches
+    near this ceiling, record the time it first crosses 99% of the peak
+    voltage. For each run with a stable final voltage, record the mean
+    voltage over the last two minutes.
+
+    Args:
+        cp_results: A list of (dataframe, current density) pairs.
+
+    Returns:
+        A dataframe of Sand's times and a dataframe of steady-state
+        voltages.
+    """
     sands = []
     pols = []
 
@@ -354,11 +543,52 @@ def analyze_sand_and_polarization(cp_results):
     return pd.DataFrame(sands), pd.DataFrame(pols)
 
 
-def diffusion_exp_model(t, a, b, k0):
+def diffusion_exp_model(
+    t: np.ndarray, a: float, b: float, k0: float
+) -> np.ndarray:
+    """Compute the exponential relaxation model at time t.
+
+    Args:
+        t: The time values, in seconds.
+        a: The amplitude of the decay.
+        b: The decay rate constant.
+        k0: The steady-state offset voltage.
+
+    Returns:
+        The modeled voltage at each time value.
+    """
     return k0 + a * np.exp(-b * t)
 
 
-def analyze_diffusion_coefficient(files, thickness_cm, cutoff_time_s, alpha=0.05):
+def analyze_diffusion_coefficient(
+    files: list[IO[bytes]],
+    thickness_cm: float,
+    cutoff_time_s: float,
+    alpha: float = 0.05,
+) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, io.BytesIO]:
+    """Fit OCV relaxation data and calculate the diffusion coefficient.
+
+    For each file, fit the model V(t) = a exp(-b t) + k0. Advance the
+    fit start time until it passes the minimum time for the chosen
+    alpha. Calculate D from the decay rate and the sample thickness.
+    Plot the fit and the log relaxation magnitude for each file.
+
+    Args:
+        files: A list of MPR file objects that contain OCV relaxation
+            data.
+        thickness_cm: The sample thickness, in cm.
+        cutoff_time_s: The latest time to include in the fit, in
+            seconds.
+        alpha: The target value of D t / L² at the fit start time.
+
+    Returns:
+        A tuple with the results dataframe, the fit curve dataframe,
+        the OCV fit plot buffer, and the log relaxation plot buffer.
+
+    Raises:
+        ValueError: The thickness, cutoff time, or alpha is not
+            positive. A file has too little data, or the fit fails.
+    """
     if thickness_cm <= 0:
         raise ValueError("Thickness must be greater than 0 cm.")
     if cutoff_time_s <= 0:
@@ -532,11 +762,32 @@ def analyze_diffusion_coefficient(files, thickness_cm, cutoff_time_s, alpha=0.05
     return results_df, fit_df, original_buf, log_buf
 
 
-def _cf_file_number(name, number):
+def _cf_file_number(name: str, number: str) -> bool:
+    """Check if a file name contains a given experiment number.
+
+    Args:
+        name: The file name to check.
+        number: The experiment number to search for, for example "03".
+
+    Returns:
+        True if the number appears as a separate token in the name.
+    """
     return re.search(rf"(^|[_\-. ]){number}([_\-. ]|$)", name) is not None
 
 
-def build_cf_file_pairs(files):
+def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
+    """Group Current Fraction files into positive and negative pairs.
+
+    Match files with number 03 to files with number 04 for the
+    positive pair. Match files with number 09 to files with number 10
+    for the negative pair.
+
+    Args:
+        files: A list of MPR file objects.
+
+    Returns:
+        A list of pair dictionaries, one for each complete pair found.
+    """
     files_03 = [f for f in files if _cf_file_number(f.name, "03")]
     files_04 = [f for f in files if _cf_file_number(f.name, "04")]
     files_09 = [f for f in files if _cf_file_number(f.name, "09")]
@@ -566,13 +817,40 @@ def build_cf_file_pairs(files):
     return pairs
 
 
-def read_cf_mpr_file(file_obj):
+def read_cf_mpr_file(file_obj: IO[bytes]) -> pd.DataFrame:
+    """Read an MPR file into a dataframe.
+
+    Args:
+        file_obj: An MPR file object.
+
+    Returns:
+        A dataframe with the raw MPR data.
+    """
     file_obj.seek(0)
     mpr = BioLogic.MPRfile(file_obj)
     return pd.DataFrame(mpr.data)
 
 
-def find_cf_mpr_column(df, candidates, required_label):
+def find_cf_mpr_column(
+    df: pd.DataFrame, candidates: list[str], required_label: str
+) -> str:
+    """Find a column name in a dataframe from a list of candidates.
+
+    Match column names by exact text first. Then match column names
+    that contain a candidate as a substring.
+
+    Args:
+        df: The dataframe to search.
+        candidates: A list of candidate column names.
+        required_label: A label for the error message if no match
+            exists.
+
+    Returns:
+        The matching column name.
+
+    Raises:
+        ValueError: No column matches any candidate.
+    """
     lower_to_col = {str(col).lower().strip(): col for col in df.columns}
     for candidate in candidates:
         if candidate.lower() in lower_to_col:
@@ -586,7 +864,34 @@ def find_cf_mpr_column(df, candidates, required_label):
     raise ValueError(f"Missing {required_label} column")
 
 
-def analyze_current_fraction_mpr(files, resistances, average_points=5000):
+def analyze_current_fraction_mpr(
+    files: list[IO[bytes]],
+    resistances: dict[str, list[float]],
+    average_points: int = 5000,
+) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, float]:
+    """Calculate the current fraction rho+ for each file pair.
+
+    For each pair, read the OCV and CA data. Calculate the initial
+    current, the steady-state current, and the migration current.
+    Calculate rho+ from these currents and the fitted resistances.
+    Plot the CA curve with current markers for each pair.
+
+    Args:
+        files: A list of CA and OCV MPR file objects.
+        resistances: A dictionary that maps each resistance key to a
+            list of R_bulk and R_i values.
+        average_points: The number of points from the end of each run
+            to average.
+
+    Returns:
+        A tuple with the summary dataframe, the per-pair results
+        dataframe, the combined plot buffer, and the average rho+
+        value.
+
+    Raises:
+        ValueError: No valid file pairs exist, or a pair has no
+            numeric data.
+    """
     file_pairs = build_cf_file_pairs(files)
     if not file_pairs:
         raise ValueError("No valid file pairs found. Upload 03/04 and/or 09/10 MPR pairs.")
@@ -722,7 +1027,22 @@ def analyze_current_fraction_mpr(files, resistances, average_points=5000):
     return summary_df, results_df, plot_buf, avg_rho
 
 
-def series100(y, current, i_L):
+def series100(
+    y: Union[float, np.ndarray], current: Union[float, np.ndarray], i_L: float
+) -> Union[float, np.ndarray]:
+    """Evaluate the Sand's time series expansion.
+
+    Sum 100 terms of the series for each combination of y and current.
+
+    Args:
+        y: One or more values of L² / (D t).
+        current: One or more current density values.
+        i_L: The limiting current density.
+
+    Returns:
+        The series value at each combination of y and current. Return
+        a scalar if both y and current are scalars.
+    """
     y_arr = np.atleast_1d(y)
     current_arr = np.atleast_1d(current)
 
@@ -743,7 +1063,31 @@ def series100(y, current, i_L):
     return result
 
 
-def solve_sands_fit(sands_df, L, D, last_stable_i, first_div_i):
+def solve_sands_fit(
+    sands_df: pd.DataFrame,
+    L: float,
+    D: float,
+    last_stable_i: float,
+    first_div_i: float,
+) -> tuple[float, np.ndarray, list[float]]:
+    """Fit the limiting current from Sand's time data.
+
+    Fit i_L to the Sand's time series model. Compute the theoretical
+    curve near the fitted limiting current.
+
+    Args:
+        sands_df: A dataframe with Sand's time and current density
+            columns.
+        L: The electrolyte thickness, in cm.
+        D: The diffusion coefficient, in cm²/s.
+        last_stable_i: The highest current density that did not
+            diverge.
+        first_div_i: The lowest current density that diverged.
+
+    Returns:
+        A tuple with the fitted limiting current, the theoretical x
+        values, and the theoretical y values.
+    """
     t_sand_s = sands_df["Sand's Time (h)"].values * 3600
     current_vals = sands_df["Current (mA/cm^2)"].values
     y_data = L**2 / (D * t_sand_s)
@@ -769,7 +1113,30 @@ def solve_sands_fit(sands_df, L, D, last_stable_i, first_div_i):
     return i_optimized, x_range * i_optimized * L, y_theory
 
 
-def plot_sands_analysis(sands_df, cell_label, L, D, last_stable_i, first_div_i):
+def plot_sands_analysis(
+    sands_df: pd.DataFrame,
+    cell_label: str,
+    L: float,
+    D: float,
+    last_stable_i: float,
+    first_div_i: float,
+) -> tuple[io.BytesIO, float]:
+    """Plot the Sand's time analysis and fit the limiting current.
+
+    Args:
+        sands_df: A dataframe with Sand's time and current density
+            columns.
+        cell_label: The label of the cell under test.
+        L: The electrolyte thickness, in cm.
+        D: The diffusion coefficient, in cm²/s.
+        last_stable_i: The highest current density that did not
+            diverge.
+        first_div_i: The lowest current density that diverged.
+
+    Returns:
+        A PNG image buffer of the plot, and the fitted limiting
+        current.
+    """
     i_opt, x_theory, y_theory = solve_sands_fit(
         sands_df, L, D, last_stable_i, first_div_i
     )

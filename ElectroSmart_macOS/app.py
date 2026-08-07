@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from galvani import BioLogic
 from PIL import Image
 import base64
+from typing import Any, IO, Optional
 
 from plotting import (
     plot_all_EIS_precond,
@@ -21,13 +22,20 @@ from plotting import (
     analyze_diffusion_coefficient,
 )
 
+version = 4.3
+
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
 with open(logo_path, "rb") as f:
     logo_b64 = base64.b64encode(f.read()).decode()
 
 # --- Helper Functions ---
-def get_discard_parameters():
+def get_discard_parameters() -> tuple[int, int]:
+    """Show number inputs for the left and right discard counts.
+
+    Returns:
+        The left discard count and the right discard count.
+    """
     col1, col2 = st.columns(2)
     with col1:
         left = st.number_input(
@@ -40,7 +48,15 @@ def get_discard_parameters():
     return left, right
 
 
-def single_or_dual_ellipse(key=None):
+def single_or_dual_ellipse(key: Optional[str] = None) -> str:
+    """Show a radio button to choose the ellipse fit mode.
+
+    Args:
+        key: A unique Streamlit widget key.
+
+    Returns:
+        The chosen fit mode label.
+    """
     return st.radio(
         "Fit Choice:",
         ["Single Ellipse", "Two Ellipse (Recommended)", "Single/Two Ellipse"],
@@ -50,7 +66,15 @@ def single_or_dual_ellipse(key=None):
     )
 
 
-def impedance_technique_radio(key):
+def impedance_technique_radio(key: str) -> str:
+    """Show a radio button to choose the impedance fit technique.
+
+    Args:
+        key: A unique Streamlit widget key.
+
+    Returns:
+        The chosen technique label.
+    """
     return st.radio(
         "Technique:",
         ["Linear fit", "Semi-ellipse fit"],
@@ -60,7 +84,23 @@ def impedance_technique_radio(key):
     )
 
 
-def process_limiting_current_bundles(files, area_cm2):
+def process_limiting_current_bundles(
+    files: list[IO[bytes]], area_cm2: float
+) -> list[dict[str, Any]]:
+    """Group Limiting Current files into CP, OCV, and PEIS bundles.
+
+    Group files by their prefix, in upload order. Within each prefix
+    group, find CP files that are followed by an OCV file and a PEIS
+    file.
+
+    Args:
+        files: A list of MPR file objects.
+        area_cm2: The active area of the cell, in cm².
+
+    Returns:
+        A list of bundle dictionaries, one for each complete CP/OCV/PEIS
+        triplet found.
+    """
     # Updated pattern: We just need to identify the Run Type (CP, OCV, PEIS)
     # This assumes the prefix is everything before the first underscore
     grouped_data = {}
@@ -117,8 +157,31 @@ def process_limiting_current_bundles(files, area_cm2):
 
 
 def fit_current_fraction_eis_resistances(
-    cell_label, pos_eis_file, neg_eis_file, discard_left, discard_right, fit_choice
-):
+    cell_label: str,
+    pos_eis_file: IO[bytes],
+    neg_eis_file: IO[bytes],
+    discard_left: int,
+    discard_right: int,
+    fit_choice: str,
+) -> tuple[dict[str, list[float]], pd.DataFrame]:
+    """Fit R_bulk and R_i from the positive and negative PEIS files.
+
+    Fit each PEIS file with the semi-ellipse method. Use the first
+    cycle as the initial resistance and the last cycle as the
+    steady-state resistance.
+
+    Args:
+        cell_label: The label of the cell under test.
+        pos_eis_file: The positive polarity PEIS file object.
+        neg_eis_file: The negative polarity PEIS file object.
+        discard_left: The number of points to discard from the left.
+        discard_right: The number of points to discard from the right.
+        fit_choice: The chosen ellipse fit mode.
+
+    Returns:
+        A dictionary of fitted resistances, and a combined fit table
+        dataframe.
+    """
     resistances = {}
     fit_tables = []
 
@@ -155,11 +218,20 @@ def fit_current_fraction_eis_resistances(
     return resistances, pd.concat(fit_tables, ignore_index=True)
 
 
-def build_eis_analysis_zip(key_list):
-    """Bundle EIS overview + semi-ellipse fit outputs for the given keys into a ZIP.
+def build_eis_analysis_zip(key_list: list[str]) -> bytes:
+    """Build a ZIP file of EIS overview and fit results.
 
-    Used by both the single-file EIS view (key_list=["Single"]) and the
-    Preconditioning view (key_list=["Positive", "Negative"]).
+    Bundle the overview plot, the summary CSV, the trend plot, and the
+    cycle plots for each key in key_list. Used by both the single-file
+    EIS view (key_list=["Single"]) and the Preconditioning view
+    (key_list=["Positive", "Negative"]).
+
+    Args:
+        key_list: The result keys to include, for example ["Single"] or
+            ["Positive", "Negative"].
+
+    Returns:
+        The ZIP file content as bytes.
     """
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
@@ -187,11 +259,33 @@ def build_eis_analysis_zip(key_list):
 
 
 def run_eis_analysis(
-    cell_type, cell_label, mpr_files, selections, discard_left, discard_right, fit_choice
-):
-    """Generate the EIS overview plot and semi-ellipse fit for each selected file,
-    storing results in session_state keyed by the labels in `selections`
-    (e.g. {"Single": fname} or {"Positive": fname, "Negative": fname}).
+    cell_type: str,
+    cell_label: str,
+    mpr_files: list[IO[bytes]],
+    selections: dict[str, str],
+    discard_left: int,
+    discard_right: int,
+    fit_choice: str,
+) -> None:
+    """Run the EIS overview plot and the semi-ellipse fit for each
+    selected file.
+
+    Store each result in session state under the matching key in
+    `selections` (for example {"Single": fname} or {"Positive": fname,
+    "Negative": fname}).
+
+    Args:
+        cell_type: The type of analysis, for example "Preconditioning".
+        cell_label: The label of the cell under test.
+        mpr_files: A list of all uploaded MPR file objects.
+        selections: A dictionary that maps each result key to a file
+            name.
+        discard_left: The number of points to discard from the left.
+        discard_right: The number of points to discard from the right.
+        fit_choice: The chosen ellipse fit mode.
+
+    Returns:
+        None. Store all results in session state.
     """
     for key, fname in selections.items():
         f_obj = next(f for f in mpr_files if f.name == fname)
@@ -216,11 +310,23 @@ def run_eis_analysis(
         st.session_state[f"fit_cycles_{key}"] = cyc_imgs
 
 
-def display_eis_analysis(keys, cell_label, zip_key):
-    """Render the persistent EIS overview + semi-ellipse fit results for `keys`.
+def display_eis_analysis(keys: list[str], cell_label: str, zip_key: str) -> None:
+    """Show the stored EIS overview and fit results for the given keys.
 
-    `keys` is ["Single"] for the single-file view or ["Positive", "Negative"]
-    for Preconditioning; the layout adapts to however many keys are passed.
+    Show a combined download button, then show the overview plot and
+    fit plot for each key. `keys` is ["Single"] for the single-file
+    view or ["Positive", "Negative"] for Preconditioning; the layout
+    adapts to however many keys are passed.
+
+    Args:
+        keys: The result keys to display, for example ["Single"] or
+            ["Positive", "Negative"].
+        cell_label: The label of the cell under test.
+        zip_key: The session state key that holds the combined ZIP
+            file.
+
+    Returns:
+        None.
     """
     has_cycle_plots = all(f"data_{key}" in st.session_state for key in keys)
     has_fit_data = any(f"fit_df_{key}" in st.session_state for key in keys)
@@ -284,7 +390,19 @@ def display_eis_analysis(keys, cell_label, zip_key):
                         )
 
 
-def build_limiting_impedance_zip(cell_label, include_summary=True, include_individual=True):
+def build_limiting_impedance_zip(
+    cell_label: str, include_summary: bool = True, include_individual: bool = True
+) -> bytes:
+    """Build a ZIP file of Limiting Current impedance results.
+
+    Args:
+        cell_label: The label of the cell under test.
+        include_summary: Include the combined plot and CSV.
+        include_individual: Include each run's individual PEIS plot.
+
+    Returns:
+        The ZIP file content as bytes.
+    """
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
         if include_summary:
@@ -311,7 +429,22 @@ def build_limiting_impedance_zip(cell_label, include_summary=True, include_indiv
     return zip_buf.getvalue()
 
 
-def prepare_limiting_current_runs(bundles, cell_label):
+def prepare_limiting_current_runs(
+    bundles: list[dict[str, Any]], cell_label: str
+) -> tuple[list[dict[str, Any]], list[tuple[pd.DataFrame, float]], pd.DataFrame]:
+    """Plot each CP run and build the combined CP summary data.
+
+    Plot each bundle's voltage against time, if not already plotted.
+    Combine the normalized run data into one dataframe.
+
+    Args:
+        bundles: A list of CP/OCV/PEIS bundle dictionaries.
+        cell_label: The label of the cell under test.
+
+    Returns:
+        The updated bundles, a list of (dataframe, current density)
+        pairs, and the combined raw data dataframe.
+    """
     cp_summaries = []
     all_cp_raw_data = []
 
@@ -338,7 +471,15 @@ def prepare_limiting_current_runs(bundles, cell_label):
     return bundles, cp_summaries, cp_raw_combined
 
 
-def display_limiting_current_runs(bundles):
+def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
+    """Show each CP run in a two-column expander layout.
+
+    Args:
+        bundles: A list of CP/OCV/PEIS bundle dictionaries.
+
+    Returns:
+        None.
+    """
     st.write("#### Individual Runs")
     for i in range(0, len(bundles), 2):
         cols = st.columns(2)
@@ -363,7 +504,7 @@ st.set_page_config(
     page_icon=icon,
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
-        "About": ("ElectroSmart v4.2 — Balsara Lab, UC Berkeley\n\n"
+        "About": (f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
                   "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
                   "**Acknowledgements & Credits:** \n - If this software contributes to any " 
                   "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
