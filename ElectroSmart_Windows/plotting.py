@@ -4,7 +4,6 @@ import pandas as pd
 import io
 from galvani import BioLogic
 from scipy.optimize import fsolve, fmin, curve_fit
-import re
 from typing import Any, IO, Optional, Union
 
 # Global style updates
@@ -762,56 +761,108 @@ def analyze_diffusion_coefficient(
     return results_df, fit_df, original_buf, log_buf
 
 
-def _cf_file_number(name: str, number: str) -> bool:
-    """Check if a file name contains a given experiment number.
+def _cf_file_type(name: str) -> Optional[str]:
+    """Classify a Current Fraction file as OCV or CA from its name.
+
+    Check for "OCV" first, then "CA", as a substring of the file
+    name.
 
     Args:
-        name: The file name to check.
-        number: The experiment number to search for, for example "03".
+        name: The file name to classify.
 
     Returns:
-        True if the number appears as a separate token in the name.
+        "OCV" if the name contains "OCV". "CA" if the name contains
+        "CA" and not "OCV". None if neither pattern matches.
     """
-    return re.search(rf"(^|[_\-. ]){number}([_\-. ]|$)", name) is not None
+    name_upper = name.upper()
+    if "OCV" in name_upper:
+        return "OCV"
+    if "CA" in name_upper:
+        return "CA"
+    return None
+
+
+def _cf_short_label(name: str) -> str:
+    """Get a short label for a Current Fraction file, for titles.
+
+    Use the leading run of digits in the file name if it has one (the
+    usual numbering convention, for example "03" from "03_OCV.mpr").
+    Otherwise, use the file name without its extension.
+
+    Args:
+        name: The file name to label.
+
+    Returns:
+        The short label.
+    """
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    digits = ""
+    for ch in stem:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return digits if digits else stem
 
 
 def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
-    """Group Current Fraction files into positive and negative pairs.
+    """Group Current Fraction files into a positive and negative trial.
 
-    Match files with number 03 to files with number 04 for the
-    positive pair. Match files with number 09 to files with number 10
-    for the negative pair.
+    Classify each file as OCV or CA from its name, in upload order.
+    Discard the first OCV file found; it is a leading rest step, not
+    part of a trial. Treat the next OCV as a trial's OCV file, and
+    collect every CA file that immediately follows it as that trial's
+    CA chain, so a chain can hold one CA file or several. Discard the
+    OCV that starts the next leading rest step, then repeat to find
+    the second trial's OCV and CA chain. Stop once two trials are
+    found, since Current Fraction expects exactly one positive and one
+    negative trial.
 
     Args:
-        files: A list of MPR file objects.
+        files: A list of CA and OCV MPR file objects, in upload order.
 
     Returns:
-        A list of pair dictionaries, one for each complete pair found.
+        A list of up to two trial dictionaries, one for each complete
+        OCV + CA chain found.
     """
-    files_03 = [f for f in files if _cf_file_number(f.name, "03")]
-    files_04 = [f for f in files if _cf_file_number(f.name, "04")]
-    files_09 = [f for f in files if _cf_file_number(f.name, "09")]
-    files_10 = [f for f in files if _cf_file_number(f.name, "10")]
+    typed_files = [(f, _cf_file_type(f.name)) for f in files]
+    typed_files = [(f, t) for f, t in typed_files if t is not None]
 
+    labels = [("R_pos", "Positive"), ("R_neg", "Negative")]
     pairs = []
-    if files_03 and files_04:
-        pairs.append(
-            {
-                "ocv_file": files_03[0],
-                "ca_file": files_04[0],
-                "experiment": "03_04",
-                "resistance_key": "R_pos",
-                "description": "Positive (03 OCV + 04 CA)",
-            }
+    ocv_count = 0
+    i = 0
+    n = len(typed_files)
+
+    while i < n and len(pairs) < 2:
+        f, t = typed_files[i]
+        if t != "OCV":
+            i += 1
+            continue
+        ocv_count += 1
+        i += 1
+        if ocv_count % 2 == 1:
+            # Odd-numbered OCV: a leading rest step. Discard it.
+            continue
+        # Even-numbered OCV: the trial's OCV file. Collect its CA chain.
+        ocv_file = f
+        ca_files = []
+        while i < n and typed_files[i][1] == "CA":
+            ca_files.append(typed_files[i][0])
+            i += 1
+        if not ca_files:
+            continue
+        resistance_key, run_label = labels[len(pairs)]
+        title = f"{_cf_short_label(ocv_file.name)} OCV + " + " + ".join(
+            f"{_cf_short_label(c.name)} CA" for c in ca_files
         )
-    if files_09 and files_10:
         pairs.append(
             {
-                "ocv_file": files_09[0],
-                "ca_file": files_10[0],
-                "experiment": "09_10",
-                "resistance_key": "R_neg",
-                "description": "Negative (09 OCV + 10 CA)",
+                "ocv_file": ocv_file,
+                "ca_files": ca_files,
+                "experiment": run_label,
+                "resistance_key": resistance_key,
+                "description": f"{run_label} ({title})",
             }
         )
     return pairs
@@ -864,37 +915,88 @@ def find_cf_mpr_column(
     raise ValueError(f"Missing {required_label} column")
 
 
+def _read_cf_ca_chain(ca_files: list[IO[bytes]]) -> pd.DataFrame:
+    """Read and concatenate a chain of CA files into one timeline.
+
+    Read each CA file's time, current, and voltage data. Zero-base
+    each file's time to its own first point, then offset it to
+    continue from where the previous file in the chain left off, so
+    the chain reads as one continuous run.
+
+    Args:
+        ca_files: The CA MPR file objects in the chain, in order.
+
+    Returns:
+        A dataframe with continuous "time", "current", "voltage", and
+        "ca_file" columns, one row per data point across the chain.
+    """
+    segments = []
+    time_offset = 0.0
+    for ca_file in ca_files:
+        ca_data = read_cf_mpr_file(ca_file)
+        ca_time_col = find_cf_mpr_column(ca_data, ["time/s", "time"], "CA time")
+        ca_voltage_col = find_cf_mpr_column(
+            ca_data, ["Ewe/V", "Ewe", "voltage", "potential"], "CA voltage"
+        )
+        ca_current_col = find_cf_mpr_column(
+            ca_data, ["I/mA", "<I>/mA", "current"], "CA current"
+        )
+        seg = pd.DataFrame(
+            {
+                "time": pd.to_numeric(ca_data[ca_time_col], errors="coerce"),
+                "current": pd.to_numeric(ca_data[ca_current_col], errors="coerce"),
+                "voltage": pd.to_numeric(ca_data[ca_voltage_col], errors="coerce")
+                * 1000,
+            }
+        ).dropna()
+        if seg.empty:
+            continue
+        seg["time"] = seg["time"] - seg["time"].iloc[0] + time_offset
+        time_offset = seg["time"].iloc[-1]
+        seg["ca_file"] = ca_file.name
+        segments.append(seg)
+    return (
+        pd.concat(segments, ignore_index=True) if segments else pd.DataFrame()
+    )
+
+
 def analyze_current_fraction_mpr(
     files: list[IO[bytes]],
     resistances: dict[str, list[float]],
     average_points: int = 5000,
 ) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, float]:
-    """Calculate the current fraction rho+ for each file pair.
+    """Calculate the current fraction rho+ for each trial.
 
-    For each pair, read the OCV and CA data. Calculate the initial
-    current, the steady-state current, and the migration current.
-    Calculate rho+ from these currents and the fitted resistances.
-    Plot the CA curve with current markers for each pair.
+    For each trial, read the OCV data and the trial's chained CA
+    files. Calculate the initial current from the first CA file, the
+    steady-state current from the tail of the CA chain, and the
+    migration current. Calculate rho+ from these currents and the
+    fitted resistances. Plot the CA chain with current markers for
+    each trial, with a dotted line at each join between CA files.
 
     Args:
         files: A list of CA and OCV MPR file objects.
         resistances: A dictionary that maps each resistance key to a
             list of R_bulk and R_i values.
-        average_points: The number of points from the end of each run
-            to average.
+        average_points: The number of points from the end of each
+            trial's CA chain to average.
 
     Returns:
-        A tuple with the summary dataframe, the per-pair results
+        A tuple with the summary dataframe, the per-trial results
         dataframe, the combined plot buffer, and the average rho+
         value.
 
     Raises:
-        ValueError: No valid file pairs exist, or a pair has no
-            numeric data.
+        ValueError: No valid trials exist, or a trial has no numeric
+            data.
     """
     file_pairs = build_cf_file_pairs(files)
     if not file_pairs:
-        raise ValueError("No valid file pairs found. Upload 03/04 and/or 09/10 MPR pairs.")
+        raise ValueError(
+            "No valid OCV + CA trials found. Upload a leading rest OCV, "
+            "a trial OCV, and one or more CA files for each of the two "
+            "trials."
+        )
 
     fig, axes = plt.subplots(len(file_pairs), 1, figsize=(12, 6 * len(file_pairs)))
     if len(file_pairs) == 1:
@@ -906,28 +1008,13 @@ def analyze_current_fraction_mpr(
 
     for idx, pair in enumerate(file_pairs):
         ocv_data = read_cf_mpr_file(pair["ocv_file"])
-        ca_data = read_cf_mpr_file(pair["ca_file"])
-
         ocv_voltage_col = find_cf_mpr_column(
             ocv_data, ["Ewe/V", "Ewe", "voltage", "potential"], "OCV voltage"
         )
-        ca_time_col = find_cf_mpr_column(ca_data, ["time/s", "time"], "CA time")
-        ca_voltage_col = find_cf_mpr_column(
-            ca_data, ["Ewe/V", "Ewe", "voltage", "potential"], "CA voltage"
-        )
-        ca_current_col = find_cf_mpr_column(
-            ca_data, ["I/mA", "<I>/mA", "current"], "CA current"
-        )
-
-        time_data = pd.to_numeric(ca_data[ca_time_col], errors="coerce")
-        current_data = pd.to_numeric(ca_data[ca_current_col], errors="coerce")
-        voltage_data = pd.to_numeric(ca_data[ca_voltage_col], errors="coerce") * 1000
         ocv_voltage = pd.to_numeric(ocv_data[ocv_voltage_col], errors="coerce") * 1000
-
-        ca_clean = pd.DataFrame(
-            {"time": time_data, "current": current_data, "voltage": voltage_data}
-        ).dropna()
         ocv_voltage = ocv_voltage.dropna()
+
+        ca_clean = _read_cf_ca_chain(pair["ca_files"])
 
         if ca_clean.empty or ocv_voltage.empty:
             raise ValueError(f"{pair['description']} has no numeric CA/OCV data.")
@@ -951,6 +1038,16 @@ def analyze_current_fraction_mpr(
 
         ax = axes[idx]
         ax.scatter(ca_clean["time"], ca_clean["current"], s=1, alpha=0.6, c="blue", label="CA curve")
+        join_mask = ca_clean["ca_file"] != ca_clean["ca_file"].shift(1)
+        join_times = ca_clean.loc[join_mask, "time"].iloc[1:]
+        for j, join_time in enumerate(join_times):
+            ax.axvline(
+                x=join_time,
+                color="gray",
+                linestyle=":",
+                alpha=0.6,
+                label="CA file join" if j == 0 else None,
+            )
         ax.axhline(y=I_o, color="red", linestyle="--", alpha=0.8, linewidth=2, label=f"I,o = {I_o:.3f} mA")
         ax.axhline(y=I_ss, color="green", linestyle="--", alpha=0.8, linewidth=2, label=f"I,ss = {I_ss:.3f} mA")
         ax.axhline(y=I_omega, color="orange", linestyle="--", alpha=0.8, linewidth=2, label=f"I,omega = {I_omega:.3f} mA")
@@ -980,7 +1077,7 @@ def analyze_current_fraction_mpr(
                 "rho_add": rho_add,
                 "resistance_type": pair["resistance_key"],
                 "ocv_file": pair["ocv_file"].name,
-                "ca_file": pair["ca_file"].name,
+                "ca_files": ", ".join(c.name for c in pair["ca_files"]),
             }
         )
 
@@ -1004,7 +1101,7 @@ def analyze_current_fraction_mpr(
         "rho_add": avg_rho,
         "resistance_type": "",
         "ocv_file": "",
-        "ca_file": "",
+        "ca_files": "",
     }
     summary_df = pd.concat([results_df, pd.DataFrame([summary_row])], ignore_index=True)
     summary_df = summary_df.rename(
@@ -1020,7 +1117,7 @@ def analyze_current_fraction_mpr(
             "rho_add": "rho+",
             "resistance_type": "Resistance Type",
             "ocv_file": "OCV File",
-            "ca_file": "CA File",
+            "ca_files": "CA Files",
         }
     )
 
