@@ -862,7 +862,7 @@ def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
                 "ca_files": ca_files,
                 "experiment": run_label,
                 "resistance_key": resistance_key,
-                "description": f"{run_label} ({title})",
+                "description": title,
             }
         )
     return pairs
@@ -1017,7 +1017,10 @@ def analyze_current_fraction_mpr(
         ca_clean = _read_cf_ca_chain(pair["ca_files"])
 
         if ca_clean.empty or ocv_voltage.empty:
-            raise ValueError(f"{pair['description']} has no numeric CA/OCV data.")
+            raise ValueError(
+                f"{pair['experiment']} trial ({pair['description']}) has no "
+                "numeric CA/OCV data."
+            )
 
         tail_n = min(int(average_points), len(ca_clean), len(ocv_voltage))
         if tail_n < 1:
