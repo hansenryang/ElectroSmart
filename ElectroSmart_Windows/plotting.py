@@ -4,6 +4,7 @@ import pandas as pd
 import io
 from galvani import BioLogic
 from scipy.optimize import fsolve, fmin, curve_fit
+import re
 from typing import Any, IO, Optional, Union
 
 # Global style updates
@@ -796,13 +797,10 @@ def _cf_short_label(name: str) -> str:
         The short label.
     """
     stem = name.rsplit(".", 1)[0] if "." in name else name
-    digits = ""
-    for ch in stem:
-        if ch.isdigit():
-            digits += ch
-        else:
-            break
-    return digits if digits else stem
+
+    pattern = re.compile(r'_(\d+)_[A-Za-z]+_C\d+$')
+    match = pattern.search(stem)
+    return match.group(1) if match else None
 
 
 def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
