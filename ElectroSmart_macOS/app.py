@@ -29,6 +29,7 @@ icon = Image.open(logo_path)
 with open(logo_path, "rb") as f:
     logo_b64 = base64.b64encode(f.read()).decode()
 
+
 # --- Helper Functions ---
 def get_discard_parameters() -> tuple[int, int]:
     """Show number inputs for the left and right discard counts.
@@ -504,16 +505,19 @@ st.set_page_config(
     page_icon=icon,
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
-        "About": (f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
-                  "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
-                  "**Acknowledgements & Credits:** \n - If this software contributes to any " 
-                  "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
-                  "**References:**\n - Limiting Current: Zach J. Hoffman *et al* 2023 *J. Electrochem. Soc.* **170** 120524 \n"
-                  "- Current Fraction/Diffusion Coefficient: Zach J. Hoffman *et al* 2021 *Solid State Ionics* **370** 115751")
-    }
+        "About": (
+            f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
+            "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
+            "**Acknowledgements & Credits:** \n - If this software contributes to any "
+            "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
+            "**References:**\n - Limiting Current: Zach J. Hoffman *et al* 2023 *J. Electrochem. Soc.* **170** 120524 \n"
+            "- Current Fraction/Diffusion Coefficient: Zach J. Hoffman *et al* 2021 *Solid State Ionics* **370** 115751"
+        ),
+    },
 )
 
-st.markdown("""
+st.markdown(
+    """
     <style>
     .tooltip {
         position: relative;
@@ -559,7 +563,9 @@ st.markdown("""
         margin: 0;
     }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.markdown(
     """
@@ -685,7 +691,9 @@ if cell_type and cell_label and uploaded_files:
 
         peis_files = [f for f in mpr_files if "PEIS" in f.name]
         if not peis_files:
-            st.warning("No PEIS files detected. Please upload at least one PEIS .mpr file.")
+            st.warning(
+                "No PEIS files detected. Please upload at least one PEIS .mpr file."
+            )
             st.stop()
 
         peis_file_names = [f.name for f in peis_files]
@@ -719,7 +727,9 @@ if cell_type and cell_label and uploaded_files:
                         discard_right,
                         fit_choice,
                     )
-                    st.session_state["fit_zip_single"] = build_eis_analysis_zip(["Single"])
+                    st.session_state["fit_zip_single"] = build_eis_analysis_zip(
+                        ["Single"]
+                    )
                     st.toast("EIS analysis complete!", icon="✅")
 
             display_eis_analysis(["Single"], cell_label, "fit_zip_single")
@@ -731,14 +741,18 @@ if cell_type and cell_label and uploaded_files:
 
         peis_files = [f for f in mpr_files if "PEIS" in f.name]
         if not peis_files:
-            st.warning("No PEIS files detected. Please upload at least two PEIS .mpr files.")
+            st.warning(
+                "No PEIS files detected. Please upload at least two PEIS .mpr files."
+            )
             st.stop()
 
         peis_file_names = [f.name for f in peis_files]
 
         st.write("#### Identify PEIS Files")
         p1, p2 = st.columns(2)
-        pos_peis_name = p1.selectbox("Positive PEIS file", peis_file_names, key="precond_pos_peis")
+        pos_peis_name = p1.selectbox(
+            "Positive PEIS file", peis_file_names, key="precond_pos_peis"
+        )
         neg_peis_default_idx = 1 if len(peis_file_names) > 1 else 0
         neg_peis_name = p2.selectbox(
             "Negative PEIS file",
@@ -783,7 +797,9 @@ if cell_type and cell_label and uploaded_files:
                         )
                         st.toast("EIS analysis complete!", icon="✅")
 
-                display_eis_analysis(["Positive", "Negative"], cell_label, "fit_zip_precond")
+                display_eis_analysis(
+                    ["Positive", "Negative"], cell_label, "fit_zip_precond"
+                )
 
     if analysis_type == "Limiting Current":
         if not mpr_files:
@@ -839,9 +855,7 @@ if cell_type and cell_label and uploaded_files:
                 st.session_state["lim_bundles_cp"] = confirmed_bundles
                 st.session_state["fname_cp"] = f"{cell_label}_all_CP_plot.png"
                 st.session_state["cp_summary"] = cp_summaries
-                cp_plot_buf = plot_all_CP_LC(
-                    cell_label, elyt_thickness, cp_summaries
-                )
+                cp_plot_buf = plot_all_CP_LC(cell_label, elyt_thickness, cp_summaries)
                 st.session_state["img_all_CP"] = cp_plot_buf
                 s_df, p_df = analyze_sand_and_polarization(cp_summaries)
                 st.session_state["sands_df"] = s_df
@@ -852,17 +866,26 @@ if cell_type and cell_label and uploaded_files:
                 )
 
                 if not s_df.empty:
-                    all_currents = sorted([abs(b["Current Density (mA/cm²)"]) for b in confirmed_bundles])
+                    all_currents = sorted(
+                        [abs(b["Current Density (mA/cm²)"]) for b in confirmed_bundles]
+                    )
                     diverged_currents = s_df["Current (mA/cm^2)"].tolist()
                     stable_currents = [
                         i for i in all_currents if round(i, 3) not in diverged_currents
                     ]
                     last_stable = max(stable_currents) if stable_currents else 0
                     first_diverge = (
-                        min(diverged_currents) if diverged_currents else max(all_currents)
+                        min(diverged_currents)
+                        if diverged_currents
+                        else max(all_currents)
                     )
                     buf_sands, _ = plot_sands_analysis(
-                        s_df, cell_label, elyt_thickness, diff_coeff, last_stable, first_diverge
+                        s_df,
+                        cell_label,
+                        elyt_thickness,
+                        diff_coeff,
+                        last_stable,
+                        first_diverge,
                     )
                     st.session_state["fname_sands_png"] = f"{cell_label}_Sands_Fit.png"
                     st.session_state["img_sands_fit"] = buf_sands
@@ -1152,14 +1175,18 @@ if cell_type and cell_label and uploaded_files:
             f for f in mpr_files if "PEIS" in f.name.upper() or "EIS" in f.name.upper()
         ]
         if not eis_files:
-            st.warning("Please upload positive and negative PEIS .mpr files for EIS resistance fitting.")
+            st.warning(
+                "Please upload positive and negative PEIS .mpr files for EIS resistance fitting."
+            )
             st.stop()
 
         eis_file_names = [f.name for f in eis_files]
 
         st.write("#### EIS Resistance Fitting")
         e1, e2 = st.columns(2)
-        pos_eis_name = e1.selectbox("Positive PEIS file", eis_file_names, key="cf_pos_eis")
+        pos_eis_name = e1.selectbox(
+            "Positive PEIS file", eis_file_names, key="cf_pos_eis"
+        )
         neg_default_idx = 1 if len(eis_file_names) > 1 else 0
         neg_eis_name = e2.selectbox(
             "Negative PEIS file",
@@ -1179,7 +1206,9 @@ if cell_type and cell_label and uploaded_files:
         fit_choice = single_or_dual_ellipse("current_fraction_fit_choice")
 
         st.write("#### Uploaded CA/OCV MPR Files")
-        st.dataframe(pd.DataFrame({"File": [f.name for f in cf_run_files]}), width="stretch")
+        st.dataframe(
+            pd.DataFrame({"File": [f.name for f in cf_run_files]}), width="stretch"
+        )
 
         if not eis_same_file and st.button("Analyze Current Fraction"):
             pos_eis_file = next(f for f in eis_files if f.name == pos_eis_name)
@@ -1194,8 +1223,10 @@ if cell_type and cell_label and uploaded_files:
                         discard_right,
                         fit_choice,
                     )
-                    summary_df, raw_df, plot_buf, avg_rho = analyze_current_fraction_mpr(
-                        cf_run_files, resistances, int(avg_points)
+                    summary_df, raw_df, plot_buf, avg_rho = (
+                        analyze_current_fraction_mpr(
+                            cf_run_files, resistances, int(avg_points)
+                        )
                     )
 
                     csv_buf = io.StringIO()
@@ -1210,9 +1241,18 @@ if cell_type and cell_label and uploaded_files:
 
                     zip_buf = io.BytesIO()
                     with zipfile.ZipFile(zip_buf, "w") as zf:
-                        zf.writestr(f"{cell_label}_current_fraction_summary.csv", csv_buf.getvalue())
-                        zf.writestr(f"{cell_label}_current_fraction_results.xlsx", excel_buf.getvalue())
-                        zf.writestr(f"{cell_label}_current_fraction_plot.png", plot_buf.getvalue())
+                        zf.writestr(
+                            f"{cell_label}_current_fraction_summary.csv",
+                            csv_buf.getvalue(),
+                        )
+                        zf.writestr(
+                            f"{cell_label}_current_fraction_results.xlsx",
+                            excel_buf.getvalue(),
+                        )
+                        zf.writestr(
+                            f"{cell_label}_current_fraction_plot.png",
+                            plot_buf.getvalue(),
+                        )
                         zf.writestr(
                             f"{cell_label}_current_fraction_eis_fits.csv",
                             eis_fit_df.to_csv(index=False),
@@ -1231,6 +1271,14 @@ if cell_type and cell_label and uploaded_files:
                     st.error(f"Current Fraction analysis failed: {exc}")
 
         if "cf_summary_df" in st.session_state:
+            st.download_button(
+                "📦 Download All Current Fraction Files (ZIP)",
+                st.session_state["cf_zip"],
+                f"{cell_label}_current_fraction_analysis.zip",
+                "application/zip",
+                width="stretch",
+            )
+
             st.write("### Current Fraction Results")
             st.metric("Average rho+", f"{st.session_state['cf_avg_rho']:.6f}")
             st.dataframe(st.session_state["cf_summary_df"], width="stretch")
@@ -1267,7 +1315,9 @@ if cell_type and cell_label and uploaded_files:
 
     if analysis_type == "Diffusion Coefficient":
         if not mpr_files:
-            st.warning("Please upload OCV relaxation .mpr files for Diffusion Coefficient analysis.")
+            st.warning(
+                "Please upload OCV relaxation .mpr files for Diffusion Coefficient analysis."
+            )
             st.stop()
 
         ocv_candidates = [f for f in mpr_files if "OCV" in f.name.upper()] or mpr_files
@@ -1333,8 +1383,12 @@ if cell_type and cell_label and uploaded_files:
 
                         excel_buf = io.BytesIO()
                         with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                            results_df.to_excel(writer, sheet_name="Summary", index=False)
-                            fit_df.to_excel(writer, sheet_name="Fit_Curves", index=False)
+                            results_df.to_excel(
+                                writer, sheet_name="Summary", index=False
+                            )
+                            fit_df.to_excel(
+                                writer, sheet_name="Fit_Curves", index=False
+                            )
                         excel_buf.seek(0)
 
                         zip_buf = io.BytesIO()
