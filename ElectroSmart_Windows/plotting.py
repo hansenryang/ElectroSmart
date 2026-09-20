@@ -786,8 +786,9 @@ def _cf_file_type(name: str) -> Optional[str]:
 def _cf_short_label(name: str) -> str:
     """Get a short label for a Current Fraction file, for titles.
 
-    Use the leading run of digits in the file name if it has one (the
-    usual numbering convention, for example "03" from "03_OCV.mpr").
+    Use the numbering-convention token in the file name if it matches
+    the pattern "_<digits>_<letters>_C<digits>" at the end (the usual
+    numbering convention, for example "03" from "..._03_OCV_C01.mpr").
     Otherwise, use the file name without its extension.
 
     Args:
@@ -798,9 +799,9 @@ def _cf_short_label(name: str) -> str:
     """
     stem = name.rsplit(".", 1)[0] if "." in name else name
 
-    pattern = re.compile(r'_(\d+)_[A-Za-z]+_C\d+$')
+    pattern = re.compile(r"_(\d+)_[A-Za-z]+_C\d+$")
     match = pattern.search(stem)
-    return match.group(1) if match else None
+    return match.group(1) if match else stem
 
 
 def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
@@ -1024,7 +1025,7 @@ def analyze_current_fraction_mpr(
         if tail_n < 1:
             raise ValueError("Average points must be at least 1.")
 
-        I_o = ca_clean["current"].iloc[1] if len(ca_clean) > 1 else ca_clean["current"].iloc[0]
+        I_o = ca_clean["current"].iloc[:10].max()
         I_ss = ca_clean["current"].iloc[-tail_n:].mean()
         delV = ca_clean["voltage"].iloc[-tail_n:].mean()
         OCV = ocv_voltage.iloc[-tail_n:].mean()
@@ -1192,7 +1193,7 @@ def solve_sands_fit(
 
     def sse(k, y, curr):
         return np.sum(np.sqrt((series100(y, curr, *k) - 1) ** 2))
-        
+
     i_guess = [(last_stable_i + first_div_i) / 2]
     res = fmin(sse, i_guess, args=(y_data, current_vals), disp=False)
     i_optimized = res[0]
@@ -1277,6 +1278,7 @@ def plot_sands_analysis(
 
     def xaxistransinv(xtrans):
         return xtrans * (i_opt * L)
+
     secax = ax1.secondary_xaxis("top", functions=(xaxistrans, xaxistransinv))
     secax.set_xlabel(r"$i/i_{lim}$")
 
