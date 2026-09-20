@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
+*.docx
 test dataset
 ElectroSmartEnv
