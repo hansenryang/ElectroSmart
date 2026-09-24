@@ -2,13 +2,13 @@
 ElectroSmart is an interface/app made for data analysis work in the Balsara Lab at UC Berkeley. It supports the following electrochemical data analysis: preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.
 
 Authors: Hansen Yang, Zirong He    
-Last updated: July 8, 2026  
+Last updated: Sep 24, 2026  
 Version: 5 (v5)
 Properties: This app is run locally on your computer. It is displayed in your default browser.
 
 ## Changes From v4 to v5
 
-1. Added transient fitting for Na-Sn alloy current-fraction analysis.
+1. Added linear transient fitting for Na-Sn alloy current fraction analysis.
 2. Updated the UI sizing to respond to browser width, improving the display of long filenames.
 
 ## Changes From v3 to v4
