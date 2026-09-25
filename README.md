@@ -4,7 +4,7 @@ ElectroSmart is an interface/app made for data analysis work in the Balsara Lab 
 Authors: Hansen Yang, Zirong He    
 Last updated: Sep 24, 2026  
 Version: 4.4 (v4.4)  
-Properties: This app is run locally on your computer. It is displayed in your default browser.
+Properties: This app can be accessed through the online Streamlit link or run locally on your computer. The online link is https://electrosmart.streamlit.app/. If run locally, it is displayed in your default browser.
 
 ## Changes From v3 to v4
 
