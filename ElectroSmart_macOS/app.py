@@ -22,7 +22,7 @@ from plotting import (
     analyze_diffusion_coefficient,
 )
 
-version = 5
+version = 4.4
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)

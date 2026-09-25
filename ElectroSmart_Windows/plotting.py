@@ -864,10 +864,81 @@ def find_cf_mpr_column(
     raise ValueError(f"Missing {required_label} column")
 
 
+def current_fraction_transient_model(
+    t: np.ndarray,
+    i_ss: float,
+    tau: float,
+    slope: float,
+    t0: float,
+    initial_current: float,
+) -> np.ndarray:
+    """Model Na-Sn current relaxation with an initial-current constraint."""
+    return (
+        i_ss
+        + (initial_current - i_ss) * np.exp(-(t + t0) / tau)
+        + slope * t
+    )
+
+
+def fit_current_fraction_iss(
+    ca_clean: pd.DataFrame, tail_n: int, initial_current: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit steady-state current for Na-Sn alloy current-fraction data."""
+    t_fit = ca_clean["time"].to_numpy(dtype=float)
+    i_fit = ca_clean["current"].to_numpy(dtype=float)
+    t_fit = t_fit - t_fit[0]
+
+    if len(t_fit) < 8:
+        raise ValueError("Transient fit requires at least 8 CA points.")
+
+    span = max(t_fit[-1] - t_fit[0], 1.0)
+    midpoint_idx = max(len(t_fit) // 2, 3)
+    t_late = t_fit[midpoint_idx:]
+    i_late = i_fit[midpoint_idx:]
+    t_late_centered = t_late - t_late[0]
+    slope_guess = (
+        np.polyfit(t_late_centered, i_late, 1)[0]
+        if len(t_late_centered) > 2
+        else 0.0
+    )
+
+    i_corrected = i_fit - slope_guess * t_fit
+    i_ss_guess = np.mean(i_corrected[-tail_n:])
+    t_early = t_fit[:midpoint_idx]
+    i_early = i_corrected[:midpoint_idx]
+    tau_guess = max((t_early[-1] - t_early[0]) / 3, 1.0)
+
+    if initial_current != i_ss_guess and i_early[0] != i_ss_guess:
+        ratio = (i_early[0] - i_ss_guess) / (initial_current - i_ss_guess)
+        t0_guess = max(-tau_guess * np.log(ratio), 0.0) if ratio > 0 else 0.0
+    else:
+        t0_guess = 0.0
+    t0_guess = min(t0_guess, span)
+
+    coeff, _ = curve_fit(
+        lambda t, i_ss, tau, t0: current_fraction_transient_model(
+            t, i_ss, tau, 0.0, t0, initial_current
+        ),
+        t_early,
+        i_early,
+        p0=[i_ss_guess, tau_guess, t0_guess],
+        bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, span * 5]),
+        maxfev=20000,
+    )
+    i_ss, tau, t0 = coeff
+    slope = slope_guess
+    amplitude = initial_current - i_ss
+    fit_curve = current_fraction_transient_model(
+        t_fit, i_ss, tau, slope, t0, initial_current
+    )
+    return np.array([i_ss, amplitude, tau, slope, t0]), t_fit, fit_curve
+
+
 def analyze_current_fraction_mpr(
     files: list[IO[bytes]],
     resistances: dict[str, list[float]],
     average_points: int = 5000,
+    iss_method: str = "Tail average",
 ) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, float]:
     """Calculate the current fraction rho+ for each file pair.
 
@@ -882,6 +953,8 @@ def analyze_current_fraction_mpr(
             list of R_bulk and R_i values.
         average_points: The number of points from the end of each run
             to average.
+        iss_method: Use tail averaging or the Na-Sn transient-fit model
+            to determine steady-state current.
 
     Returns:
         A tuple with the summary dataframe, the per-pair results
@@ -937,13 +1010,34 @@ def analyze_current_fraction_mpr(
             raise ValueError("Average points must be at least 1.")
 
         I_o = ca_clean["current"].iloc[1] if len(ca_clean) > 1 else ca_clean["current"].iloc[0]
-        I_ss = ca_clean["current"].iloc[-tail_n:].mean()
         delV = ca_clean["voltage"].iloc[-tail_n:].mean()
         OCV = ocv_voltage.iloc[-tail_n:].mean()
 
         Rbulk_o, R_i_o, Rbulk_ss, R_i_ss = resistances[pair["resistance_key"]]
         delV_prime = delV - OCV
         I_omega = delV_prime / (Rbulk_o + R_i_o)
+
+        iss_fit_amplitude = np.nan
+        iss_fit_tau = np.nan
+        iss_fit_slope = np.nan
+        iss_fit_t0 = np.nan
+        iss_fit_curve = None
+        iss_fit_time = None
+        if iss_method.startswith("Transient fit"):
+            coeff, t_fit, iss_fit_curve = fit_current_fraction_iss(
+                ca_clean, tail_n, I_omega
+            )
+            (
+                I_ss,
+                iss_fit_amplitude,
+                iss_fit_tau,
+                iss_fit_slope,
+                iss_fit_t0,
+            ) = coeff
+            iss_fit_time = ca_clean["time"].iloc[0] + t_fit
+        else:
+            I_ss = ca_clean["current"].iloc[-tail_n:].mean()
+
         rho_add = (I_ss / I_omega) * (
             (delV_prime - I_omega * R_i_o) / (delV_prime - I_ss * R_i_ss)
         )
@@ -954,13 +1048,22 @@ def analyze_current_fraction_mpr(
         ax.axhline(y=I_o, color="red", linestyle="--", alpha=0.8, linewidth=2, label=f"I,o = {I_o:.3f} mA")
         ax.axhline(y=I_ss, color="green", linestyle="--", alpha=0.8, linewidth=2, label=f"I,ss = {I_ss:.3f} mA")
         ax.axhline(y=I_omega, color="orange", linestyle="--", alpha=0.8, linewidth=2, label=f"I,omega = {I_omega:.3f} mA")
-        ax.axvspan(
-            ca_clean["time"].iloc[-tail_n],
-            ca_clean["time"].iloc[-1],
-            alpha=0.2,
-            color="green",
-            label=f"SS region (last {tail_n} points)",
-        )
+        if iss_fit_curve is not None:
+            ax.plot(
+                iss_fit_time,
+                iss_fit_curve,
+                color="black",
+                linewidth=1.5,
+                label="Na-Sn transient fit",
+            )
+        else:
+            ax.axvspan(
+                ca_clean["time"].iloc[-tail_n],
+                ca_clean["time"].iloc[-1],
+                alpha=0.2,
+                color="green",
+                label=f"SS region (last {tail_n} points)",
+            )
         ax.set_xlabel("Time (seconds)")
         ax.set_ylabel("Current (mA)")
         ax.set_title(f"{pair['experiment']}: {pair['description']}")
@@ -979,6 +1082,11 @@ def analyze_current_fraction_mpr(
                 "delV_prime": delV_prime,
                 "rho_add": rho_add,
                 "resistance_type": pair["resistance_key"],
+                "iss_method": iss_method,
+                "iss_fit_amplitude": iss_fit_amplitude,
+                "iss_fit_tau": iss_fit_tau,
+                "iss_fit_slope": iss_fit_slope,
+                "iss_fit_t0": iss_fit_t0,
                 "ocv_file": pair["ocv_file"].name,
                 "ca_file": pair["ca_file"].name,
             }
@@ -1003,6 +1111,11 @@ def analyze_current_fraction_mpr(
         "delV_prime": np.nan,
         "rho_add": avg_rho,
         "resistance_type": "",
+        "iss_method": "",
+        "iss_fit_amplitude": np.nan,
+        "iss_fit_tau": np.nan,
+        "iss_fit_slope": np.nan,
+        "iss_fit_t0": np.nan,
         "ocv_file": "",
         "ca_file": "",
     }
@@ -1019,6 +1132,11 @@ def analyze_current_fraction_mpr(
             "delV_prime": "delV' (mV)",
             "rho_add": "rho+",
             "resistance_type": "Resistance Type",
+            "iss_method": "I,ss Method",
+            "iss_fit_amplitude": "I,ss Fit Amplitude (mA)",
+            "iss_fit_tau": "I,ss Fit tau (s)",
+            "iss_fit_slope": "I,ss Fit slope (mA/s)",
+            "iss_fit_t0": "I,ss Fit t0 (s)",
             "ocv_file": "OCV File",
             "ca_file": "CA File",
         }
