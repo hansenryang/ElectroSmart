@@ -22,7 +22,7 @@ from plotting import (
     analyze_diffusion_coefficient,
 )
 
-version = 4.3
+version = 4.4
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
@@ -502,6 +502,7 @@ def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
 st.set_page_config(
     page_title="ElectroSmart",
     page_icon=icon,
+    layout="wide",
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
         "About": (f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
@@ -737,14 +738,19 @@ if cell_type and cell_label and uploaded_files:
         peis_file_names = [f.name for f in peis_files]
 
         st.write("#### Identify PEIS Files")
-        p1, p2 = st.columns(2)
-        pos_peis_name = p1.selectbox("Positive PEIS file", peis_file_names, key="precond_pos_peis")
+        pos_peis_name = st.selectbox(
+            "Positive PEIS file",
+            peis_file_names,
+            key="precond_pos_peis",
+            width="stretch",
+        )
         neg_peis_default_idx = 1 if len(peis_file_names) > 1 else 0
-        neg_peis_name = p2.selectbox(
+        neg_peis_name = st.selectbox(
             "Negative PEIS file",
             peis_file_names,
             index=neg_peis_default_idx,
             key="precond_neg_peis",
+            width="stretch",
         )
 
         precond_same_file = pos_peis_name == neg_peis_name
@@ -1147,6 +1153,13 @@ if cell_type and cell_label and uploaded_files:
             step=100,
             key="cf_avg_points",
         )
+        iss_method = st.radio(
+            "I,ss method:",
+            ["Tail average", "Transient fit (Na-Sn alloy)"],
+            horizontal=True,
+            key="cf_iss_method",
+            help="The transient-fit model is intended for Na-Sn alloy current-fraction analysis.",
+        )
 
         eis_files = [
             f for f in mpr_files if "PEIS" in f.name.upper() or "EIS" in f.name.upper()
@@ -1158,14 +1171,19 @@ if cell_type and cell_label and uploaded_files:
         eis_file_names = [f.name for f in eis_files]
 
         st.write("#### EIS Resistance Fitting")
-        e1, e2 = st.columns(2)
-        pos_eis_name = e1.selectbox("Positive PEIS file", eis_file_names, key="cf_pos_eis")
+        pos_eis_name = st.selectbox(
+            "Positive PEIS file",
+            eis_file_names,
+            key="cf_pos_eis",
+            width="stretch",
+        )
         neg_default_idx = 1 if len(eis_file_names) > 1 else 0
-        neg_eis_name = e2.selectbox(
+        neg_eis_name = st.selectbox(
             "Negative PEIS file",
             eis_file_names,
             index=neg_default_idx,
             key="cf_neg_eis",
+            width="stretch",
         )
 
         eis_same_file = pos_eis_name == neg_eis_name
@@ -1195,7 +1213,7 @@ if cell_type and cell_label and uploaded_files:
                         fit_choice,
                     )
                     summary_df, raw_df, plot_buf, avg_rho = analyze_current_fraction_mpr(
-                        cf_run_files, resistances, int(avg_points)
+                        cf_run_files, resistances, int(avg_points), iss_method
                     )
 
                     csv_buf = io.StringIO()

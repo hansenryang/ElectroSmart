@@ -6,6 +6,11 @@ Last updated: Sep 24, 2026
 Version: 4.4 (v4.4)  
 Properties: This app can be accessed through the online Streamlit link or run locally on your computer. The online link is https://electrosmart.streamlit.app/. If run locally, it is displayed in your default browser.
 
+## Changes From v4.3 to v4.4
+
+1. Added linear transient fitting for Na-Sn alloy current fraction analysis.
+2. Updated the UI sizing to respond to browser width, improving the display of long filenames.
+
 ## Changes From v3 to v4
 
 1. Added generic EIS analysis.
