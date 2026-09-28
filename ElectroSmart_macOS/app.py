@@ -1249,6 +1249,15 @@ if cell_type and cell_label and uploaded_files:
                     st.error(f"Current Fraction analysis failed: {exc}")
 
         if "cf_summary_df" in st.session_state:
+
+            st.download_button(
+                "📦 Download All Current Fraction Files (ZIP)",
+                st.session_state["cf_zip"],
+                f"{cell_label}_current_fraction_analysis.zip",
+                "application/zip",
+                width="stretch",
+            )
+            
             st.write("### Current Fraction Results")
             st.metric("Average rho+", f"{st.session_state['cf_avg_rho']:.6f}")
             st.dataframe(st.session_state["cf_summary_df"], width="stretch")

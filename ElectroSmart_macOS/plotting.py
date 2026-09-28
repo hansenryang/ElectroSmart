@@ -1009,7 +1009,7 @@ def analyze_current_fraction_mpr(
         if tail_n < 1:
             raise ValueError("Average points must be at least 1.")
 
-        I_o = ca_clean["current"].iloc[1] if len(ca_clean) > 1 else ca_clean["current"].iloc[0]
+        I_o = ca_clean["current"].iloc[:10].max()
         delV = ca_clean["voltage"].iloc[-tail_n:].mean()
         OCV = ocv_voltage.iloc[-tail_n:].mean()
 
