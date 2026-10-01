@@ -870,20 +870,26 @@ def current_fraction_transient_model(
     tau: float,
     slope: float,
     t0: float,
-    initial_current: float,
+    i_omega: float,
 ) -> np.ndarray:
-    """Model Na-Sn current relaxation with an initial-current constraint."""
+    """Model Na-Sn current relaxation, constrained by the theoretical i_omega."""
     return (
         i_ss
-        + (initial_current - i_ss) * np.exp(-(t + t0) / tau)
+        + (i_omega - i_ss) * np.exp(-(t + t0) / tau)
         + slope * t
     )
 
 
-def fit_current_fraction_iss(
-    ca_clean: pd.DataFrame, tail_n: int, initial_current: float
+def fit_current_fraction_iss_transient(
+    ca_clean: pd.DataFrame, tail_n: int, i_omega: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Fit steady-state current for Na-Sn alloy current-fraction data."""
+    """Fit steady-state current for Na-Sn alloy current-fraction data.
+
+    Use the transient-only algorithm. Fit a linear decay to the late
+    data, subtract it from the early data, then fit the transient
+    model to the early data. i_omega is the calculated theoretical
+    current, not a measured value.
+    """
     t_fit = ca_clean["time"].to_numpy(dtype=float)
     i_fit = ca_clean["current"].to_numpy(dtype=float)
     t_fit = t_fit - t_fit[0]
@@ -891,47 +897,48 @@ def fit_current_fraction_iss(
     if len(t_fit) < 8:
         raise ValueError("Transient fit requires at least 8 CA points.")
 
-    span = max(t_fit[-1] - t_fit[0], 1.0)
+    t_range = max(t_fit[-1] - t_fit[0], 1.0)
     midpoint_idx = max(len(t_fit) // 2, 3)
     t_late = t_fit[midpoint_idx:]
-    i_late = i_fit[midpoint_idx:]
+    i_late_raw = i_fit[midpoint_idx:]  # spliced from the original current data
     t_late_centered = t_late - t_late[0]
-    slope_guess = (
-        np.polyfit(t_late_centered, i_late, 1)[0]
+    # Deterministic linear regression, not an optimizer starting value
+    slope_fit = (
+        np.polyfit(t_late_centered, i_late_raw, 1)[0]
         if len(t_late_centered) > 2
         else 0.0
     )
 
-    i_corrected = i_fit - slope_guess * t_fit
+    i_corrected = i_fit - slope_fit * t_fit
     i_ss_guess = np.mean(i_corrected[-tail_n:])
     t_early = t_fit[:midpoint_idx]
-    i_early = i_corrected[:midpoint_idx]
+    # Spliced from current data with the linear decay (slope_fit * t) subtracted
+    i_early_detrended = i_corrected[:midpoint_idx]
     tau_guess = max((t_early[-1] - t_early[0]) / 3, 1.0)
 
-    if initial_current != i_ss_guess and i_early[0] != i_ss_guess:
-        ratio = (i_early[0] - i_ss_guess) / (initial_current - i_ss_guess)
+    if i_omega != i_ss_guess and i_early_detrended[0] != i_ss_guess:
+        ratio = (i_early_detrended[0] - i_ss_guess) / (i_omega - i_ss_guess)
         t0_guess = max(-tau_guess * np.log(ratio), 0.0) if ratio > 0 else 0.0
     else:
         t0_guess = 0.0
-    t0_guess = min(t0_guess, span)
+    t0_guess = min(t0_guess, t_range)
 
     coeff, _ = curve_fit(
         lambda t, i_ss, tau, t0: current_fraction_transient_model(
-            t, i_ss, tau, 0.0, t0, initial_current
+            t, i_ss, tau, 0.0, t0, i_omega
         ),
         t_early,
-        i_early,
+        i_early_detrended,
         p0=[i_ss_guess, tau_guess, t0_guess],
-        bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, span * 5]),
+        bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, t_range * 5]),
         maxfev=20000,
     )
     i_ss, tau, t0 = coeff
-    slope = slope_guess
-    amplitude = initial_current - i_ss
+    amplitude = i_omega - i_ss
     fit_curve = current_fraction_transient_model(
-        t_fit, i_ss, tau, slope, t0, initial_current
+        t_fit, i_ss, tau, slope_fit, t0, i_omega
     )
-    return np.array([i_ss, amplitude, tau, slope, t0]), t_fit, fit_curve
+    return np.array([i_ss, amplitude, tau, slope_fit, t0]), t_fit, fit_curve
 
 
 def analyze_current_fraction_mpr(
@@ -1009,13 +1016,13 @@ def analyze_current_fraction_mpr(
         if tail_n < 1:
             raise ValueError("Average points must be at least 1.")
 
-        I_o = ca_clean["current"].iloc[:10].max()
+        i_o = ca_clean["current"].iloc[:10].max()
         delV = ca_clean["voltage"].iloc[-tail_n:].mean()
         OCV = ocv_voltage.iloc[-tail_n:].mean()
 
         Rbulk_o, R_i_o, Rbulk_ss, R_i_ss = resistances[pair["resistance_key"]]
         delV_prime = delV - OCV
-        I_omega = delV_prime / (Rbulk_o + R_i_o)
+        i_omega = delV_prime / (Rbulk_o + R_i_o)
 
         iss_fit_amplitude = np.nan
         iss_fit_tau = np.nan
@@ -1024,11 +1031,11 @@ def analyze_current_fraction_mpr(
         iss_fit_curve = None
         iss_fit_time = None
         if iss_method.startswith("Transient fit"):
-            coeff, t_fit, iss_fit_curve = fit_current_fraction_iss(
-                ca_clean, tail_n, I_omega
+            coeff, t_fit, iss_fit_curve = fit_current_fraction_iss_transient(
+                ca_clean, tail_n, i_omega
             )
             (
-                I_ss,
+                i_ss,
                 iss_fit_amplitude,
                 iss_fit_tau,
                 iss_fit_slope,
@@ -1036,18 +1043,18 @@ def analyze_current_fraction_mpr(
             ) = coeff
             iss_fit_time = ca_clean["time"].iloc[0] + t_fit
         else:
-            I_ss = ca_clean["current"].iloc[-tail_n:].mean()
+            i_ss = ca_clean["current"].iloc[-tail_n:].mean()
 
-        rho_add = (I_ss / I_omega) * (
-            (delV_prime - I_omega * R_i_o) / (delV_prime - I_ss * R_i_ss)
+        rho_add = (i_ss / i_omega) * (
+            (delV_prime - i_omega * R_i_o) / (delV_prime - i_ss * R_i_ss)
         )
         rho_values.append(rho_add)
 
         ax = axes[idx]
         ax.scatter(ca_clean["time"], ca_clean["current"], s=1, alpha=0.6, c="blue", label="CA curve")
-        ax.axhline(y=I_o, color="red", linestyle="--", alpha=0.8, linewidth=2, label=f"I,o = {I_o:.3f} mA")
-        ax.axhline(y=I_ss, color="green", linestyle="--", alpha=0.8, linewidth=2, label=f"I,ss = {I_ss:.3f} mA")
-        ax.axhline(y=I_omega, color="orange", linestyle="--", alpha=0.8, linewidth=2, label=f"I,omega = {I_omega:.3f} mA")
+        ax.axhline(y=i_o, color="red", linestyle="--", alpha=0.8, linewidth=2, label=f"I,o = {i_o:.3f} mA")
+        ax.axhline(y=i_ss, color="green", linestyle="--", alpha=0.8, linewidth=2, label=f"I,ss = {i_ss:.3f} mA")
+        ax.axhline(y=i_omega, color="orange", linestyle="--", alpha=0.8, linewidth=2, label=f"I,omega = {i_omega:.3f} mA")
         if iss_fit_curve is not None:
             ax.plot(
                 iss_fit_time,
@@ -1074,9 +1081,9 @@ def analyze_current_fraction_mpr(
             {
                 "experiment": pair["experiment"],
                 "description": pair["description"],
-                "I_o": I_o,
-                "I_ss": I_ss,
-                "I_omega": I_omega,
+                "i_o": i_o,
+                "i_ss": i_ss,
+                "i_omega": i_omega,
                 "delV": delV,
                 "OCV": OCV,
                 "delV_prime": delV_prime,
@@ -1103,9 +1110,9 @@ def analyze_current_fraction_mpr(
     summary_row = {
         "experiment": "AVERAGE",
         "description": "Average of all experiments",
-        "I_o": np.nan,
-        "I_ss": np.nan,
-        "I_omega": np.nan,
+        "i_o": np.nan,
+        "i_ss": np.nan,
+        "i_omega": np.nan,
         "delV": np.nan,
         "OCV": np.nan,
         "delV_prime": np.nan,
@@ -1124,9 +1131,9 @@ def analyze_current_fraction_mpr(
         columns={
             "experiment": "Experiment",
             "description": "Description",
-            "I_o": "I,o (mA)",
-            "I_ss": "I,ss (mA)",
-            "I_omega": "I,omega (mA)",
+            "i_o": "I,o (mA)",
+            "i_ss": "I,ss (mA)",
+            "i_omega": "I,omega (mA)",
             "delV": "delV (mV)",
             "OCV": "OCV (mV)",
             "delV_prime": "delV' (mV)",
