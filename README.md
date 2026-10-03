@@ -1,46 +1,46 @@
 # ElectroSmart
-ElectroSmart is an interface/app made for data analysis work in the Balsara Lab at UC Berkeley. It supports the following electrochemical data analysis: preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.
 
-Authors: Hansen Yang, Zirong He    
-Last updated: Sep 24, 2026  
-Version: 4.4 (v4.4)  
-Properties: This app can be accessed through the online Streamlit link or run locally on your computer. The online link is https://electrosmart.streamlit.app/. If run locally, it is displayed in your default browser.
+An interface/app for data analysis work in the Balsara Lab.
 
-## Changes From v4.3 to v4.4
+Author: Hansen Yang, Zirong He    
+Last updated: October 1, 2026  
+Version: 4 (v4)  
+Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.  
+Properties: This app is run locally on your computer. It is displayed in your default browser.
 
-1. Added linear transient fitting for Na-Sn alloy current fraction analysis.
-2. Updated the UI sizing to respond to browser width, improving the display of long filenames.
+## Changes Since v4
+
+1. Changed how Current Fraction finds its files.
+   - The app no longer looks for the numbers `03/04` and `09/10` in file names.
+   - The app now reads the file names for `OCV` or `CA`. It uses the upload order to find the two trials.
+   - Each trial can have one CA file or several CA files. The app joins several CA files into one continuous run.
+   - The CA plot shows a dotted line at each join between CA files.
+   - The results table column `CA File` is now `CA Files`. It lists every CA file in the trial.
 
 ## Changes From v3 to v4
 
-1. Added generic EIS analysis.
-   - Allows analysis of single `.mpr` EIS files.
-   - Uses single/double ellipse fitting, similar to preconditioning analysis.
-
-2. Added Current Fraction analysis.
+1. Added Current Fraction analysis.
    - Uses `.mpr` CA/OCV files instead of `.txt` files.
    - Keeps the existing `03/04` and `09/10` file numbering convention.
    - Uses positive and negative PEIS/EIS `.mpr` files to fit `R_bulk` and `R_i`.
    - Uses the first fitted EIS cycle as the initial resistance and the last fitted EIS cycle as the steady-state resistance.
    - Exports summary CSV, Excel, plot PNG, EIS fit table, and ZIP bundle.
 
-3. Added Diffusion Coefficient fitting.
-   - Fits OCV relaxation data with $V(t) = A e^{-kt} + C$.
-   - Calculates $D = k L^2 / \pi^2$.
+2. Added Diffusion Coefficient fitting.
+   - Fits OCV relaxation data with `V(t) = A exp(-k t) + C`.
+   - Calculates `D = k L^2 / pi^2`.
    - User inputs thickness in `um`, cutoff time in `h`, and alpha.
    - Default alpha is `0.05`.
    - Default cutoff time is `4 h`.
    - Reports total polarization/relaxation time in hours.
-   - Reports $D$ `(cm^2/s)` in scientific notation.
-   - Plots OCV fit and $\log(|V(t) - V_\infty| / \text{mV})$ vs time for sanity check, reliable D comes from the linear regime.
+   - Reports `D (cm^2/s)` in scientific notation.
+   - Plots OCV fit and `log(|V(t) - V_inf| / mV)` vs time for sanity check, reliable D comes from the linear regime.
 
-4. Added cross-platform launchers.
+3. Added cross-platform launchers.
    - Windows users can run `ElectroSmart.bat`.
    - macOS users can run `ElectroSmart_v4_macOS.command` in the macOS package.
 
-5. Added `openpyxl` to `requirements.txt` for Excel export.
-
-6. Added three button colors to distinguish functionality: run analysis, download files, and clear files.
+4. Added `openpyxl` to `requirements.txt` for Excel export.
 
 ## Changes From v2 to v3
 
@@ -50,35 +50,6 @@ Properties: This app can be accessed through the online Streamlit link or run lo
    - A Desktop shortcut to ElectroSmart is set up when the `.bat` file is first run.
 2. Eliminated unnecessary library imports in `app.py` and `plotting.py`.
 3. Enabled the recommended choices of fitting and type of fit, semi-ellipse fit and two ellipse, as the default selection.
-
-## v0, v1, v2
-
-1. Implemented EIS fitting using semi-ellipses.
-   - Fits the semi-circle region of the EIS using one and two semi-ellipses:
-
-```math
-\frac{(x - x_0)^2}{a^2} + \frac{(y - y_0)^2}{b^2} = 1
-```
-
-   - User selects positive and negative EIS files and inputs the number of leftmost and rightmost points to discard.
-   - Default fitting method is semi-ellipse fit with 2 points discarded on each side.
-   - Reports and plots the trend of $R_\text{bulk}$, $R_i$, and $R_\text{total}$ for positive and negative EIS.
-   - Shows individual ellipse fits for each EIS cycle.
-   - All generated plots are available for download.
-
-2. Implemented EIS fitting and Sand's time analysis for Limiting Current.
-   - Fits Sand's time data to the 100-term series solution for the limiting current:
-
-```math
-1 = 8\left(\frac{i}{i_L}\right)\sum_{n=1}^{100} \frac{1}{\beta_n^2}\left(1 - e^{-\beta_n^2 \frac{D t_\text{Sand}}{L^2}}\right), \quad \beta_n = (2n-1)\pi
-```
-
-   - Identifies polarization data.
-   - User inputs electrode area in `cm^2`, electrolyte thickness in `cm`, and diffusion coefficient in `cm^2/s`.
-   - Reports limiting current $i_L$ calculated through optimization.
-   - Plots normalized voltage vs time curves.
-   - Plots Sand's time fit to the series solution.
-
 
 ## Description of Files
 
@@ -160,13 +131,46 @@ Upload all `.mpr` files for a limiting current experiment. The app expects CP, O
 
 ### Current Fraction
 
-Upload `.mpr` files. Current Fraction expects the existing experiment numbering convention:
+Upload all `.mpr` files of the run. Include the OCV, CA, and PEIS/EIS files. The app uses the PEIS/EIS files only to fit `R_bulk` and `R_i`.
 
-- `03` OCV + `04` CA for the positive pair
-- `09` OCV + `10` CA for the negative pair
-- Positive and negative PEIS/EIS `.mpr` files for resistance fitting
+The app finds the two trials from the file names and the upload order. Each OCV file name must contain `OCV`. Each CA file name must contain `CA`. The file numbers do not matter.
 
-The app fits PEIS data to obtain `R_bulk` and `R_i`. The first fitted EIS cycle is used as initial resistance. The last fitted EIS cycle is used as steady-state resistance.
+The app uses this order:
+
+1. The first `OCV` file is a leading rest step. The app discards it.
+2. The next `OCV` file is the positive trial OCV.
+3. Every `CA` file directly after it forms the positive CA chain.
+4. The next `OCV` file is a leading rest step. The app discards it.
+5. The next `OCV` file is the negative trial OCV.
+6. Every `CA` file directly after it forms the negative CA chain.
+
+The app stops after it finds two trials. The first trial is positive. The second trial is negative.
+
+Example (file names are shortened):
+
+```text
+01_OCV                 leading rest step (discarded)
+02_CA                  ignored (comes after a discarded OCV)
+03_OCV                 positive trial OCV
+04_CA, 05_CA           positive CA chain (joined into one run)
+07_OCV                 leading rest step (discarded)
+08_OCV                 negative trial OCV
+09_CA                  negative CA chain
+```
+
+The app joins the CA files of a chain into one continuous timeline. It calculates the currents from this joined run:
+
+- `I,o` is the highest current in the first 10 points of the chain.
+- `I,ss` is set by the `I,ss method` option (see below).
+
+Select the positive PEIS file and the negative PEIS file in the app. The app fits `R_bulk` and `R_i` for each file. It uses the first fitted EIS cycle as the initial resistance. It uses the last fitted EIS cycle as the steady-state resistance. The positive PEIS file must match the first trial. The negative PEIS file must match the second trial.
+
+`I,ss` method:
+
+- `Tail average` averages the last N points of the CA chain. Set N with `Points from the end to average`. The same N is used to average the OCV and the final voltage.
+- `Transient fit (Na-Sn alloy)` fits the CA chain with a transient model. Use it for Na-Sn alloy current-fraction data only.
+
+Make sure no other file name contains `CA` or `OCV`. The app finds these names by text match. A name such as `CALIBRATION` is read as a CA file.
 
 ### Diffusion Coefficient
 
@@ -178,23 +182,23 @@ Upload OCV relaxation `.mpr` files. Enter:
 
 The app fits:
 
-```math
-V(t) = A e^{-kt} + C
+```text
+V(t) = A exp(-k t) + C
 ```
 
 and calculates:
 
-```math
-D = \frac{k L^2}{\pi^2}
+```text
+D = k L^2 / pi^2
 ```
 
 The log plot uses:
 
-```math
-\log\!\left(\frac{|V(t) - V_\infty|}{\text{mV}}\right)
+```text
+log(|V(t) - V_inf| / mV)
 ```
 
-where $V_\infty$ is the fitted offset $C$.
+where `V_inf` is the fitted offset `C`.
 
 ## Test Data
 
@@ -209,21 +213,14 @@ They are:
 
 They contain raw `.mpr` files of preconditioning and limiting current runs.
 
-## References
-
-- Limiting Current:
-  - Zach J. Hoffman, Aashutosh Mistry, Venkat Srinivasan, and Nitash P. Balsara. *J. Electrochem. Soc.* **2023**, *170*(12), 120524. DOI: 10.1149/1945-7111/ad1470
-  - Jaeyong Lee, Se Young Kim, Zach J. Hoffman, Guoying Chen, and Nitash P. Balsara. *ACS Energy Letters* **2024**, *9*(4), 1796–1802. DOI: 10.1021/acsenergylett.4c00480
-- Current Fraction/Diffusion Coefficient:
-  - Zach J. Hoffman, Deep B. Shah, and Nitash P. Balsara. *Solid State Ionics* **2021**, *370*, 115751. DOI: 10.1016/j.ssi.2021.115751
-
 ## Points of Concern / FAQs
 
 1. Please upload all files of a run in `.mpr` format.
 2. Older `.mpr` files from older EC-Lab software may not work with the `galvani` library. Please re-download `.mpr` files from newer EC-Lab software if needed.
 3. Do not close the terminal window opened by the launcher. The terminal must remain open while the app is in use.
 4. The terminal logs function calls and errors. If the terminal is accidentally closed, close the Streamlit browser tab and re-open the launcher.
+5. If Current Fraction shows `No valid OCV + CA trials found`, check the file names and the upload order. Each trial needs a leading rest OCV file, a trial OCV file, and at least one CA file after the trial OCV file. Upload all the files at the same time.
 
 ## Contact Information
 
-Should any questions or issues arise, please contact Hansen (hansenry [at] berkeley [dot] edu) or Zirong He (zironghe [at] berkeley [dot] edu). Feedback, testimonials, and notes of appreciation are always welcome. If this software contributes to any publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.
+Should any questions or issues arise, please contact Hansen (hansenry [at] berkeley [dot] edu) or Zirong He (zironghe@berkeley.edu). Feedback, testimonials, and notes of appreciation are always welcome. If this software contributes to any publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.
