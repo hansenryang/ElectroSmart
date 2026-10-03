@@ -1046,13 +1046,13 @@ def analyze_current_fraction_mpr(
 
     For each trial, read the OCV data and the trial's chained CA
     files. Calculate the initial current from the first CA file, the
-    steady-state current from the CA chain, and the migration
-    current. Calculate rho+ from these currents and the fitted
-    resistances. Plot the CA chain with current markers for each
-    trial, with a dotted line at each join between CA files.
+    steady-state current from the CA chain, and the migration current.
+    Calculate rho+ from these currents and the fitted resistances.
+    Plot the CA chain with current markers for each trial, with a
+    dotted line at each join between CA files.
 
     Args:
-        files: A list of CA and OCV MPR file objects.
+        files: A list of CA and OCV MPR file objects, in upload order.
         resistances: A dictionary that maps each resistance key to a
             list of R_bulk and R_i values.
         average_points: The number of points from the end of each
@@ -1061,7 +1061,7 @@ def analyze_current_fraction_mpr(
             to determine steady-state current.
 
     Returns:
-        A tuple with the summary dataframe, the per-pair results
+        A tuple with the summary dataframe, the per-trial results
         dataframe, the combined plot buffer, and the average rho+
         value.
 
@@ -1105,7 +1105,8 @@ def analyze_current_fraction_mpr(
         if tail_n < 1:
             raise ValueError("Average points must be at least 1.")
 
-        i_o = ca_clean["current"].iloc[:10].max()
+        i_first = ca_clean["current"].iloc[:10]
+        i_o = i_first.loc[i_first.abs().idxmax()]  # largest magnitude, keeps sign
         delV = ca_clean["voltage"].iloc[-tail_n:].mean()
         OCV = ocv_voltage.iloc[-tail_n:].mean()
 
