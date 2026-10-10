@@ -3,12 +3,30 @@
 An interface/app for data analysis work in the Balsara Lab.
 
 Author: Hansen Yang, Zirong He    
-Last updated: October 1, 2026  
-Version: 4 (v4)  
+Last updated: October 9, 2026  
+Version: 4.5 (v4.5)  
 Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.  
-Properties: This app is run locally on your computer. It is displayed in your default browser.
+Properties: This app is run locally on your computer, or on the Streamlit website. It is displayed in your default browser.
 
-## Changes Since v4
+## Changes in v4.5
+
+The two main changes are the metadata file and the checks for empty and unreadable files. Together, they record how the app made each result, and which input files it did not use.
+
+1. Added a metadata file for each analysis.
+   - The metadata `.txt` file records: the ElectroSmart version, the analysis name, the time of the analysis, the cell type, the cell label, the files that the analysis used, all uploaded `.mpr` files, the input parameters, the EIS fit settings, the `I,ss` method, and all warnings and errors that the app shows at the time of download.
+   - Each ZIP file includes the metadata file. Each analysis also has a purple `Download Metadata (TXT)` button.
+   - See `Metadata File` in the Analysis Notes.
+
+2. Added checks for empty and unreadable `.mpr` files.
+   - The app shows a warning for each file that is empty, and for each file that `galvani` cannot read. The warning is nonblocking (the app allows data analysis even if there are bad files).
+   - EIS Fit, Preconditioning, and Limiting Current do not use these files. In Limiting Current, a bad file does not change how the app pairs the other files.
+   - See `Empty and Unreadable Files` in the Analysis Notes.
+
+3. Changed how Limiting Current finds the runs that do not diverge.
+   - The Polarization CSV lists only the runs that do not diverge.
+   - The app now counts the peaks in the slope of the voltage curve. A run that has two slope peaks diverges.
+
+## Changes From v4 to v4.4
 
 1. Changed how Current Fraction finds its files.
    - The app no longer looks for the numbers `03/04` and `09/10` in file names.
@@ -59,26 +77,29 @@ Properties: This app is run locally on your computer. It is displayed in your de
 2. `plotting.py`  
    The mathematical workhorse of the application. Performs the electrochemical analysis.
 
-3. `ElectroSmart.bat`  
+3. `validation.py`  
+   Checks each uploaded `.mpr` file. Finds files that are empty, files that `galvani` cannot read, and files that do not have the necessary data columns.
+
+4. `ElectroSmart.bat`  
    Windows launcher. It installs dependencies, creates a Desktop shortcut, opens the browser, and runs the Streamlit app.
 
-4. `requirements.txt`  
+5. `requirements.txt`  
    Required Python libraries needed to run ElectroSmart.
 
-5. `Logo.ico`  
+6. `Logo.ico`  
    Display icon for the Windows shortcut.
 
-6. `Logo.png`  
+7. `Logo.png`  
    ElectroSmart logo image.
 
-7. `.gitignore`  
+8. `.gitignore`  
    Prevents virtual environments, Python cache files, and local Streamlit folders from being committed to GitHub.
 
 ## Libraries and Packages Needed
 
 These are also listed in `requirements.txt`.
 
-1. streamlit
+1. streamlit (version 1.50 or later)
 2. pandas
 3. matplotlib
 4. numpy
@@ -120,6 +141,61 @@ python -m streamlit run app.py --server.port 8501
 6. Click OK on all windows.
 
 ## Analysis Notes
+
+### Metadata File
+
+Each analysis makes a metadata `.txt` file. Keep this file with your results. It tells you how the app made them.
+
+The file contains these parts:
+
+1. Header: the ElectroSmart version, the analysis name, the time of the analysis, the cell type, and the cell label.
+2. `Files Used in This Analysis`: the files that the analysis used.
+3. `Input Parameters`: the values that you entered for this analysis.
+4. `EIS Fitting`: the technique, the points to discard (left and right), and the fit choice. This part shows only if the analysis fits EIS data.
+5. `All Uploaded .mpr Files`: the name of each uploaded file, including the files that the analysis did not use.
+6. `Warnings Shown at Download`: each warning and error that the app shows when you download the file. If there are none, this part shows `None`.
+
+The file records only the inputs that the analysis needs. For Limiting Current, Potentiometric Data, the file shows the diffusion coefficient only if the app made a Sand's time fit.
+
+You can get the metadata file in two ways:
+
+- Each ZIP file includes it.
+- Each analysis has a purple `Download Metadata (TXT)` button. In Preconditioning, the button is next to `Generate EIS Plots`. In the other analyses, the button is with the download buttons for the individual files.
+
+The button shows after you run the analysis.
+
+Notes on the times:
+
+- The app records the settings and the time of the analysis when you run the analysis. If you change a setting after that, run the analysis again.
+- The app records the warnings and the list of uploaded files when you download the file.
+- The time of the analysis is in the time zone of your browser. The file also shows the UTC offset, for example `2026-10-09 21:37:48 UTC-07:00 (America/Los_Angeles)`. If the app cannot find the time zone, it shows the time in UTC.
+
+### Empty and Unreadable Files
+
+The app reads each `.mpr` file one time, at upload. It puts each file in one of three groups:
+
+- Good: the app can read the file, and the file has data.
+- Empty: the file has 0 bytes, or it has no data rows.
+- Unreadable: `galvani` cannot read the file. This occurs with a corrupt file, and with some files from older EC-Lab software.
+
+The app shows a warning that lists the empty files and the unreadable files. The warning is nonblocking (the app allows data analysis even if there are bad files). If the app can use none of the uploaded files, it shows an error.
+
+Each analysis uses these checks as follows:
+
+- EIS Fit (Single File) and Preconditioning: The app does not show a bad file in the PEIS file list. The file that you select must have the columns `cycle number`, `Re(Z)/Ohm`, and `-Im(Z)/Ohm`.
+- Limiting Current: See the rules below.
+- Current Fraction and Diffusion Coefficient: These analyses do not use the checks yet. A bad file can make the analysis fail with an error message. Remove the bad file and upload the files again.
+
+Rules for Limiting Current:
+
+1. The app pairs the CP, OCV, and PEIS files by name and upload order. It includes the bad files in this step. Thus, a bad file does not change the other runs.
+2. If the CP file of a run is bad, the app does not use the run.
+3. If the PEIS file of a run is bad, the app uses the run for the potentiometric analysis only.
+4. The app does not check the OCV file, because the analysis does not use it.
+5. A CP file must have the columns `time/s`, `Ewe/V`, and `I/mA` (or `<I>/mA`).
+6. The app shows a warning that lists each run it cannot fully use, and the reason.
+
+The metadata file records all of these warnings.
 
 ### Preconditioning
 
@@ -216,10 +292,12 @@ They contain raw `.mpr` files of preconditioning and limiting current runs.
 ## Points of Concern / FAQs
 
 1. Please upload all files of a run in `.mpr` format.
-2. Older `.mpr` files from older EC-Lab software may not work with the `galvani` library. Please re-download `.mpr` files from newer EC-Lab software if needed.
+2. Older `.mpr` files from older EC-Lab software may not work with the `galvani` library. The app shows a warning for each file that it cannot read. Please re-download `.mpr` files from newer EC-Lab software if needed.
 3. Do not close the terminal window opened by the launcher. The terminal must remain open while the app is in use.
 4. The terminal logs function calls and errors. If the terminal is accidentally closed, close the Streamlit browser tab and re-open the launcher.
-5. If Current Fraction shows `No valid OCV + CA trials found`, check the file names and the upload order. Each trial needs a leading rest OCV file, a trial OCV file, and at least one CA file after the trial OCV file. Upload all the files at the same time.
+5. If the app shows a warning for an empty file, the experiment possibly did not record data for that step. Check the file in EC-Lab. See `Empty and Unreadable Files` in the Analysis Notes.
+6. Keep the metadata `.txt` file with your results. It records the files, the settings, and the warnings for each analysis.
+7. If Current Fraction shows `No valid OCV + CA trials found`, check the file names and the upload order. Each trial needs a leading rest OCV file, a trial OCV file, and at least one CA file after the trial OCV file. Upload all the files at the same time.
 
 ## Contact Information
 
