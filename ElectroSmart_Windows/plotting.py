@@ -266,6 +266,7 @@ def semiellipse_fit(
     run_label: str,
     must_use_dual: bool,
     must_use_single: bool,
+    cycle_title: Optional[str] = None,
 ) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
     """Fit each PEIS cycle in an MPR file with one or two semi-ellipses.
 
@@ -285,6 +286,8 @@ def semiellipse_fit(
         run_label: The label for this run, for example "Positive".
         must_use_dual: Force the two-ellipse model for every cycle.
         must_use_single: Force the one-ellipse model for every cycle.
+        cycle_title: The title for each cycle plot. If None, use the
+            cell label, the run label, and the cycle number.
 
     Returns:
         A tuple with the summary dataframe, the trend plot buffer, the
@@ -364,7 +367,11 @@ def semiellipse_fit(
         )
         lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
         plt.plot(x_plot, y_p, "r-", label=lbl)
-        plt.title(f"{cell_label} {run_label} Cycle {int(c)}")
+        plt.title(
+            cycle_title
+            if cycle_title is not None
+            else f"{cell_label} {run_label} Cycle {int(c)}"
+        )
         plt.xlabel("Re(Z)/Ohm")
         plt.ylabel("-Im(Z)/Ohm")
         plt.gca().set_aspect("equal")
@@ -449,6 +456,7 @@ def plot_limiting_peis_fit(
     discard_right: int,
     must_use_dual: bool,
     must_use_single: bool,
+    density: Optional[float] = None,
 ) -> tuple[Optional[io.BytesIO], pd.DataFrame, io.StringIO]:
     """Fit the PEIS data for one Limiting Current run.
 
@@ -462,6 +470,8 @@ def plot_limiting_peis_fit(
         discard_right: The number of points to discard from the right.
         must_use_dual: Force the two-ellipse model for every cycle.
         must_use_single: Force the one-ellipse model for every cycle.
+        density: The applied current density, in mA/cm². Show it in the
+            plot title in place of the run label and the cycle number.
 
     Returns:
         The first cycle image buffer, or None if no cycle exists. Also
@@ -476,6 +486,11 @@ def plot_limiting_peis_fit(
         run_label,
         must_use_dual,
         must_use_single,
+        cycle_title=(
+            None
+            if density is None
+            else f"{cell_label}: {abs(density):.3f} mA/cm²"
+        ),
     )
     if cycle_imgs:
         return cycle_imgs[0][1], summary_df, csv_buf

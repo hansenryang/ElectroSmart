@@ -193,8 +193,8 @@ def show_skipped_runs(bundles: list[dict[str, Any]]) -> None:
         elif b["peis_issue"]:
             lines.append(
                 f"- Run {b['run_no']}: PEIS file has a problem "
-                f"({b['peis_issue']}) The app uses this run for the "
-                "impedance analysis only."
+                f"({b['peis_issue']}) The app does not use this run for the "
+                "impedance analysis."
             )
     if lines:
         st.warning(
@@ -1163,6 +1163,7 @@ if cell_type and cell_label and uploaded_files:
                             discard_right,
                             fit_choice == "Two Ellipse (Recommended)",
                             fit_choice == "Single Ellipse",
+                            b["Current Density (mA/cm²)"],
                         )
                         b["fig_peis"] = fit_img_buf
 
