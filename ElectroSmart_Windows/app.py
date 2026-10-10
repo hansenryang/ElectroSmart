@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from galvani import BioLogic
 from PIL import Image
 import base64
+from datetime import datetime, timedelta, timezone
 from typing import Any, IO, Optional
 
 from plotting import (
@@ -400,6 +401,35 @@ def fit_current_fraction_eis_resistances(
     return resistances, pd.concat(fit_tables, ignore_index=True)
 
 
+def analysis_time_text() -> str:
+    """Give the current time in the time zone of the browser.
+
+    Read the time zone from Streamlit (st.context). Do not use the
+    time zone of the computer that runs Python. On the Streamlit
+    website, that computer uses UTC. If Streamlit does not give a time
+    zone, use UTC.
+
+    Returns:
+        The date, the time, the UTC offset, and the time zone name,
+        for example "2026-10-09 21:37:05 UTC-07:00 (America/Los_Angeles)".
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        # The offset is UTC minus the local time, in minutes.
+        offset_min = st.context.timezone_offset
+        zone_name = st.context.timezone
+    except Exception:
+        offset_min = None
+        zone_name = None
+    if offset_min is None:
+        return now.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+
+    local = now.astimezone(timezone(timedelta(minutes=-offset_min)))
+    text = local.strftime("%Y-%m-%d %H:%M:%S") + " " + local.strftime("UTC%z")
+    text = text[:-2] + ":" + text[-2:]
+    return f"{text} ({zone_name})" if zone_name else text
+
+
 def build_metadata_text(
     analysis: str,
     cell_type: str,
@@ -408,7 +438,8 @@ def build_metadata_text(
 ) -> str:
     """Build the metadata text for one analysis.
 
-    Write a header with the ElectroSmart version, the analysis name,
+    Call this function when the analysis runs. Write a header with the
+    ElectroSmart version, the analysis name, the time of the analysis,
     the cell type, and the cell label. Then write each section as a
     title and a list of "name: value" lines. Skip a section that has
     no lines.
@@ -431,6 +462,7 @@ def build_metadata_text(
         "=" * len(title),
         f"ElectroSmart Version: {version}",
         f"Analysis: {analysis}",
+        f"Time of Analysis: {analysis_time_text()}",
         f"Cell Type: {cell_type}",
         f"Cell Label: {cell_label}",
     ]
@@ -637,7 +669,11 @@ def run_eis_analysis(
 
 
 def display_eis_analysis(
-    keys: list[str], cell_label: str, zip_key: str, meta_key: str
+    keys: list[str],
+    cell_label: str,
+    zip_key: str,
+    meta_key: str,
+    show_metadata_button: bool = True,
 ) -> None:
     """Show the stored EIS overview and fit results for the given keys.
 
@@ -653,6 +689,9 @@ def display_eis_analysis(
         zip_key: The session state key that holds the combined ZIP
             file.
         meta_key: The session state key that holds the metadata text.
+        show_metadata_button: Show the metadata download button below
+            the overview plots. Set this to False if the caller shows
+            the button in a different position.
 
     Returns:
         None.
@@ -687,7 +726,8 @@ def display_eis_analysis(
                     key=f"btn_{key}",
                 )
 
-    metadata_download_button(meta_key, f"{cell_label}_Full_Metadata.txt")
+    if show_metadata_button:
+        metadata_download_button(meta_key, f"{cell_label}_Full_Metadata.txt")
 
     st.divider()
 
@@ -1162,7 +1202,10 @@ if cell_type and cell_label and uploaded_files:
                 discard_left, discard_right = get_discard_parameters()
                 fit_choice = single_or_dual_ellipse("preconditioning_fit_choice")
 
-                if st.button("Generate EIS Plots", key="precond_generate_button"):
+                generate_col, metadata_col, _ = st.columns([1, 1, 3])
+                if generate_col.button(
+                    "Generate EIS Plots", key="precond_generate_button"
+                ):
                     with st.spinner(
                         f"Analyzing Positive and Negative PEIS for {cell_label}... This may take a moment."
                     ):
@@ -1200,11 +1243,20 @@ if cell_type and cell_label and uploaded_files:
                         )
                         st.toast("EIS analysis complete!", icon="✅")
 
+                # Draw this button after the analysis, so that it shows
+                # immediately. It goes in the column next to Generate.
+                metadata_download_button(
+                    "fit_meta_precond",
+                    f"{cell_label}_Full_Metadata.txt",
+                    metadata_col,
+                )
+
                 display_eis_analysis(
                     ["Positive", "Negative"],
                     cell_label,
                     "fit_zip_precond",
                     "fit_meta_precond",
+                    show_metadata_button=False,
                 )
 
     if analysis_type == "Limiting Current":
