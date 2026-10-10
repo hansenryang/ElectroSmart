@@ -194,7 +194,7 @@ def show_skipped_runs(bundles: list[dict[str, Any]]) -> None:
             lines.append(
                 f"- Run {b['run_no']}: PEIS file has a problem "
                 f"({b['peis_issue']}) The app uses this run for the "
-                "potentiometric analysis only."
+                "impedance analysis only."
             )
     if lines:
         st.warning(

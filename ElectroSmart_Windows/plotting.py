@@ -4,6 +4,7 @@ import pandas as pd
 import io
 from galvani import BioLogic
 from scipy.optimize import fsolve, fmin, curve_fit
+from scipy.signal import find_peaks, savgol_filter
 import re
 from typing import Any, IO, Optional, Union
 
@@ -481,6 +482,86 @@ def plot_limiting_peis_fit(
     return None, summary_df, csv_buf
 
 
+def is_diverging(
+    time_s: np.ndarray,
+    v_abs: np.ndarray,
+    smooth_frac: float = 0.12,
+    rise_frac: float = 0.5,
+    early_frac: float = 0.1,
+    min_span_v: float = 1e-3,
+) -> bool:
+    """Tell whether a voltage profile diverges.
+
+    A profile that does not diverge rises, and its slope then falls
+    toward zero. The curve stays concave down, so the slope has one
+    peak, at the start. A profile that diverges rises, slows to a
+    shoulder, and then rises faster again. Its slope falls to a minimum
+    and then recovers, so the slope has a second peak. This function
+    counts the peaks.
+
+    Resample the voltage onto a uniform time grid. Smooth it and take
+    its slope with a Savitzky-Golay filter. Scale the slope by the mean
+    slope of the whole run (the total voltage change divided by the run
+    time). This is the same as scaling the voltage change and the run
+    time to 1. Then the size of a peak does not depend on the units,
+    the run time, the voltage offset, or the sharp start of the run.
+    Count the peaks of the slope, including a peak at the start and a
+    peak at the end. Ignore a peak that is smaller than rise_frac. Also
+    ignore a peak in the first early_frac of the run, because the
+    initial transient has more than one slope peak.
+
+    Args:
+        time_s: The time values, in seconds. They must not decrease.
+        v_abs: The absolute cell voltage at each time value.
+        smooth_frac: The filter window, as a fraction of the 2000
+            resampled points.
+        rise_frac: The smallest peak that counts, in units of the mean
+            slope of the run. A slow creep after the shoulder is
+            smaller than this and does not count.
+        early_frac: The fraction of the run, from the start, in which a
+            slope peak does not count.
+        min_span_v: The smallest voltage change that the test accepts,
+            in V. A profile that changes less than this does not
+            diverge. This guard uses the real voltage, so apply it
+            before any scaling.
+
+    Returns:
+        True if the profile diverges. False if it does not diverge, or
+        if the run has too few points to test.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    v_abs = np.asarray(v_abs, dtype=float)
+    if len(time_s) < 50 or time_s[-1] <= time_s[0]:
+        return False
+
+    n_grid = 2000
+    t = np.linspace(time_s[0], time_s[-1], n_grid)
+    v = np.interp(t, time_s, v_abs)
+    if np.ptp(v) < min_span_v:
+        return False
+
+    window = int(smooth_frac * n_grid) | 1  # the window must be odd
+    dv = savgol_filter(v, window, 3, deriv=1, delta=t[1] - t[0])
+
+    # The filter is least reliable at the end of the run, so drop the
+    # last half window. Keep the start. It holds the initial peak.
+    dv = dv[: n_grid - window // 2]
+
+    # Scale the slope by the mean slope of the run.
+    dv = dv / (np.ptp(v) / (t[-1] - t[0]))
+
+    # Pad both ends with a low value, so that find_peaks can count a
+    # peak at the first point and at the last point.
+    pad = dv.min() - np.ptp(dv)
+    padded = np.concatenate([[pad], dv, [pad]])
+    peaks, _ = find_peaks(padded, prominence=rise_frac)
+
+    # Index 0 of the padded signal is the pad. Index 1 is the start.
+    positions = (peaks - 1) / n_grid
+    counted = [p for p in positions if p <= 0 or p >= early_frac]
+    return bool(len(counted) >= 2)
+
+
 def analyze_sand_and_polarization(
     cp_results: list[tuple[pd.DataFrame, float]]
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -488,8 +569,8 @@ def analyze_sand_and_polarization(
 
     Find the highest voltage across all runs. For each run that reaches
     near this ceiling, record the time it first crosses 99% of the peak
-    voltage. For each run with a stable final voltage, record the mean
-    voltage over the last two minutes.
+    voltage. For each run that does not diverge (see is_diverging),
+    record the mean voltage over the last two minutes.
 
     Args:
         cp_results: A list of (dataframe, current density) pairs.
@@ -529,17 +610,16 @@ def analyze_sand_and_polarization(
         t_end_s = df["norm_time_h"].iloc[-1] * 3600
         df_final = df[(df["norm_time_h"] * 3600) >= (t_end_s - 120)]
 
-        if not df_final.empty:
-            the_v_vals = df_final["Ewe/V"].abs().values
-            ratio = the_v_vals[-1] / the_v_vals[0]
-            if ratio >= 0.998 and ratio <= 1.001:
-                v_avg = df_final["Ewe/V"].mean()
-                pols.append(
-                    {
-                        "Current (mA/cm^2)": round(density, 3),
-                        "Steady State Voltage (V)": v_avg,
-                    }
-                )
+        if not df_final.empty and not is_diverging(
+            (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+        ):
+            v_avg = df_final["Ewe/V"].mean()
+            pols.append(
+                {
+                    "Current (mA/cm^2)": round(density, 3),
+                    "Steady State Voltage (V)": v_avg,
+                }
+            )
     return pd.DataFrame(sands), pd.DataFrame(pols)
 
 
