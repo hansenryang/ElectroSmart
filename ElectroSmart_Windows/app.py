@@ -21,6 +21,18 @@ from plotting import (
     analyze_current_fraction_mpr,
     analyze_diffusion_coefficient,
 )
+from validation import (
+    LIMITING_CP_REQUIREMENTS,
+    PEIS_REQUIREMENTS,
+    STATUS_EMPTY,
+    STATUS_OK,
+    STATUS_UNREADABLE,
+    ColumnProblem,
+    FileReport,
+    check_columns,
+    explain_file_problem,
+    inspect_mpr_file,
+)
 
 version = 4.4
 
@@ -84,8 +96,114 @@ def impedance_technique_radio(key: str) -> str:
     )
 
 
+def get_file_reports(files: list[IO[bytes]]) -> dict[str, FileReport]:
+    """Check each uploaded file once and keep the results.
+
+    Read a file only if it is new. Keep the report in session state, so
+    that a rerun of the script does not read the file again. Drop the
+    reports of files that are no longer uploaded.
+
+    Args:
+        files: The uploaded MPR file objects.
+
+    Returns:
+        The file reports, keyed by file name.
+    """
+    cache = st.session_state.get("filecheck_cache", {})
+    new_cache = {}
+    reports = {}
+    for f in files:
+        key = (f.name, f.size, getattr(f, "file_id", ""))
+        new_cache[key] = cache[key] if key in cache else inspect_mpr_file(f)
+        reports[f.name] = new_cache[key]
+    st.session_state["filecheck_cache"] = new_cache
+    return reports
+
+
+def show_file_warnings(reports: dict[str, FileReport]) -> None:
+    """Show a warning for each empty file and each unreadable file.
+
+    The warnings do not stop the app. The app does not use these files.
+
+    Args:
+        reports: The file reports, keyed by file name.
+
+    Returns:
+        None.
+    """
+    empty = [r for r in reports.values() if r.status == STATUS_EMPTY]
+    unreadable = [r for r in reports.values() if r.status == STATUS_UNREADABLE]
+
+    if empty:
+        lines = "\n".join(f"- `{r.name}`: {r.detail}" for r in empty)
+        st.warning(
+            "**These files are empty.** The app will not use them in EIS Fit, "
+            "Preconditioning, or Limiting Current.\n\n" + lines
+        )
+    if unreadable:
+        lines = "\n".join(f"- `{r.name}`: {r.detail}" for r in unreadable)
+        st.warning(
+            "**galvani cannot read these files.** The app will not use them in "
+            "EIS Fit, Preconditioning, or Limiting Current. "
+            "Download the .mpr files again from the newest EC-Lab software.\n\n"
+            + lines
+        )
+
+
+def columns_ok(problems: list[ColumnProblem]) -> bool:
+    """Show an error for each file that misses a required column.
+
+    Args:
+        problems: The result of check_columns.
+
+    Returns:
+        True if there are no problems. False if at least one file
+        misses a column.
+    """
+    for p in problems:
+        st.error(
+            f"**{p.file_name}** does not have the required column(s): "
+            f"{', '.join(p.missing)}."
+        )
+        st.caption("Columns in this file: " + ", ".join(p.found))
+    return not problems
+
+
+def show_skipped_runs(bundles: list[dict[str, Any]]) -> None:
+    """Show which runs the app cannot use, and for which analysis.
+
+    A run with a bad CP file is not used for the potentiometric or the
+    impedance analysis. A run with a bad PEIS file is not used for the
+    impedance analysis only. The OCV file is not used by either
+    analysis.
+
+    Args:
+        bundles: A list of CP/OCV/PEIS bundle dictionaries.
+
+    Returns:
+        None.
+    """
+    lines = []
+    for b in bundles:
+        if b["cp_issue"]:
+            lines.append(
+                f"- Run {b['run_no']}: CP file has a problem ({b['cp_issue']}) "
+                "The app does not use this run."
+            )
+        elif b["peis_issue"]:
+            lines.append(
+                f"- Run {b['run_no']}: PEIS file has a problem "
+                f"({b['peis_issue']}) The app uses this run for the "
+                "potentiometric analysis only."
+            )
+    if lines:
+        st.warning(
+            "**The app cannot fully use these runs.**\n\n" + "\n".join(lines)
+        )
+
+
 def process_limiting_current_bundles(
-    files: list[IO[bytes]], area_cm2: float
+    files: list[IO[bytes]], area_cm2: float, reports: dict[str, FileReport]
 ) -> list[dict[str, Any]]:
     """Group Limiting Current files into CP, OCV, and PEIS bundles.
 
@@ -93,13 +211,21 @@ def process_limiting_current_bundles(
     group, find CP files that are followed by an OCV file and a PEIS
     file.
 
+    Pair the files by name and order only. Include files that are
+    empty or unreadable. A bad file keeps its place in its run, so it
+    does not change the other pairs. Read the current only from a good
+    CP file.
+
     Args:
-        files: A list of MPR file objects.
+        files: A list of all uploaded MPR file objects.
         area_cm2: The active area of the cell, in cm².
+        reports: The file reports, keyed by file name.
 
     Returns:
-        A list of bundle dictionaries, one for each complete CP/OCV/PEIS
-        triplet found.
+        A list of bundle dictionaries, one for each CP/OCV/PEIS
+        triplet found. The key "run_no" holds the run number. The keys
+        "cp_issue" and "peis_issue" hold the reason that the CP file or
+        the PEIS file cannot be used, or None if it can be used.
     """
     # Updated pattern: We just need to identify the Run Type (CP, OCV, PEIS)
     # This assumes the prefix is everything before the first underscore
@@ -138,11 +264,24 @@ def process_limiting_current_bundles(
 
                 # Check if the next two files complete the triplet
                 if f_ocv["type"] == "OCV" and f_peis["type"] == "PEIS":
-                    current_mA = get_current_from_mpr(f_cp["obj"])
-                    density = current_mA / area_cm2 if area_cm2 > 0 else 0
+                    cp_issue = explain_file_problem(
+                        reports, f_cp["name"], LIMITING_CP_REQUIREMENTS
+                    )
+                    peis_issue = explain_file_problem(
+                        reports, f_peis["name"], PEIS_REQUIREMENTS
+                    )
+                    if cp_issue is None:
+                        current_mA = get_current_from_mpr(f_cp["obj"])
+                        density = current_mA / area_cm2 if area_cm2 > 0 else 0
+                    else:
+                        current_mA = float("nan")
+                        density = float("nan")
                     results.append(
                         {
                             "prefix": prefix,
+                            "run_no": len(results) + 1,
+                            "cp_issue": cp_issue,
+                            "peis_issue": peis_issue,
                             "Bundled Files": f"{f_cp['name']}\n{f_ocv['name']}\n{f_peis['name']}",
                             "Current Density (mA/cm²)": density,
                             "Applied Current (mA)": current_mA,
@@ -422,7 +561,7 @@ def build_limiting_impedance_zip(
                 fit_buf = bundle.get("fig_peis")
                 if fit_buf:
                     zf.writestr(
-                        f"{cell_label}_Run_{idx + 1}_PEIS_Plot.png",
+                        f"{cell_label}_Run_{bundle['run_no']}_PEIS_Plot.png",
                         fit_buf.getvalue(),
                     )
 
@@ -460,7 +599,7 @@ def prepare_limiting_current_runs(
 
         df_cp_export = b["df_cp"].copy()
         df_cp_export["density_mA_cm2"] = b["Current Density (mA/cm²)"]
-        df_cp_export["Run_no"] = i + 1
+        df_cp_export["Run_no"] = b["run_no"]
         all_cp_raw_data.append(df_cp_export)
 
     cp_raw_combined = (
@@ -489,7 +628,7 @@ def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
                 b = bundles[idx]
                 with cols[j]:
                     with st.expander(
-                        f"Run {idx+1}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
+                        f"Run {b['run_no']}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
                     ):
                         st.write("**Files**")
                         st.write(b["Bundled Files"])
@@ -627,6 +766,9 @@ if st.button("Clear files", key="clear_files_button", type="primary"):
     st.session_state.uploader_key += 1
     st.rerun()
 
+file_reports = get_file_reports(uploaded_files) if uploaded_files else {}
+show_file_warnings(file_reports)
+
 if not (cell_type and cell_label and uploaded_files):
     cell_type_indicator = " cell type," if not (cell_type) else ""
     cell_label_indicator = " cell label," if not (cell_label) else ""
@@ -664,7 +806,16 @@ if cell_type and cell_label and uploaded_files:
                 st.session_state.pop(k)
         st.session_state.last_fnames = curr_fnames
 
-    mpr_files = list(uploaded_files)  # uploader already filters to .mpr
+    # EIS Fit, Preconditioning, and Limiting Current use only the files
+    # that are not empty and that galvani can read. Current Fraction and
+    # Diffusion Coefficient use all uploaded files.
+    all_mpr_files = list(uploaded_files)
+    mpr_files = [
+        f for f in uploaded_files if file_reports[f.name].status == STATUS_OK
+    ]
+    if not mpr_files:
+        st.error("None of the uploaded files can be used. See the warnings above.")
+        st.stop()
 
     st.divider()
     analysis_type = st.radio(
@@ -693,6 +844,11 @@ if cell_type and cell_label and uploaded_files:
 
         st.write("#### Identify PEIS File")
         single_peis_name = st.selectbox("PEIS file", peis_file_names, key="single_peis")
+
+        if not columns_ok(
+            check_columns(file_reports, [single_peis_name], PEIS_REQUIREMENTS)
+        ):
+            st.stop()
 
         selections = {"Single": single_peis_name}
 
@@ -760,6 +916,13 @@ if cell_type and cell_label and uploaded_files:
                 "Please select a distinct file for each polarity."
             )
         else:
+            if not columns_ok(
+                check_columns(
+                    file_reports, [pos_peis_name, neg_peis_name], PEIS_REQUIREMENTS
+                )
+            ):
+                st.stop()
+
             selections = {"Positive": pos_peis_name, "Negative": neg_peis_name}
             st.divider()
             tech = impedance_technique_radio("preconditioning_impedance_technique")
@@ -814,17 +977,23 @@ if cell_type and cell_label and uploaded_files:
             "Diffusion Coefficient (cm²/s):", value=6.9e-8, format="%.4e"
         )
 
-        bundles = process_limiting_current_bundles(mpr_files, active_area)
+        # Pair the runs from all uploaded files. A bad file keeps its place.
+        bundles = process_limiting_current_bundles(
+            list(uploaded_files), active_area, file_reports
+        )
+        show_skipped_runs(bundles)
+        pot_bundles = [b for b in bundles if b["cp_issue"] is None]
+        imp_bundles = [b for b in pot_bundles if b["peis_issue"] is None]
 
         st.write("#### A. Confirm Runs")
 
         if not bundles:
             st.warning("No CP/OCV/PEIS run bundles were detected.")
 
-        if st.button("Confirm", disabled=not bundles):
+        if st.button("Confirm", disabled=not pot_bundles):
             with st.spinner("Preparing run confirmation plots ..."):
                 confirmed_bundles, _, _ = prepare_limiting_current_runs(
-                    bundles, cell_label
+                    pot_bundles, cell_label
                 )
                 st.session_state["lim_runs_confirmed"] = True
                 st.session_state["lim_bundles_confirmed"] = confirmed_bundles
@@ -835,10 +1004,10 @@ if cell_type and cell_label and uploaded_files:
         st.divider()
         st.write("#### B. Potentiometric Data")
 
-        if st.button("Process Potentiometric Data", disabled=not bundles):
+        if st.button("Process Potentiometric Data", disabled=not pot_bundles):
             with st.spinner("Analyzing Potentiometric Data ..."):
                 confirmed_bundles, cp_summaries, _ = prepare_limiting_current_runs(
-                    bundles, cell_label
+                    pot_bundles, cell_label
                 )
 
                 st.session_state["lim_bundles_confirmed"] = confirmed_bundles
@@ -974,12 +1143,12 @@ if cell_type and cell_label and uploaded_files:
             discard_left, discard_right = get_discard_parameters()
             fit_choice = single_or_dual_ellipse("limiting_current_fit_choice")
 
-            if st.button("Process Impedance Data", disabled=not bundles):
+            if st.button("Process Impedance Data", disabled=not imp_bundles):
                 with st.spinner("Analyzing Impedance Data ..."):
                     peis_results = []
                     all_peis_raw_data = []
 
-                    for i, b in enumerate(bundles):
+                    for b in imp_bundles:
                         b["f_peis"].seek(0)
                         mpr_peis = BioLogic.MPRfile(b["f_peis"])
                         df_peis_raw = pd.DataFrame(mpr_peis.data)
@@ -989,7 +1158,7 @@ if cell_type and cell_label and uploaded_files:
                         fit_img_buf, fit_df, fit_csv = plot_limiting_peis_fit(
                             b["f_peis"],
                             cell_label,
-                            f"Run {i+1}",
+                            f"Run {b['run_no']}",
                             discard_left,
                             discard_right,
                             fit_choice == "Two Ellipse (Recommended)",
@@ -998,7 +1167,7 @@ if cell_type and cell_label and uploaded_files:
                         b["fig_peis"] = fit_img_buf
 
                         dens = b["Current Density (mA/cm²)"]
-                        fit_df["Run_no"] = i + 1
+                        fit_df["Run_no"] = b["run_no"]
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
                         fit_df = fit_df[
@@ -1013,7 +1182,7 @@ if cell_type and cell_label and uploaded_files:
                         peis_results.append(fit_df)
 
                     peis_raw_combined = pd.concat(all_peis_raw_data)
-                    st.session_state["lim_bundles_peis"] = bundles
+                    st.session_state["lim_bundles_peis"] = imp_bundles
                     st.session_state["peis_summary_all"] = pd.concat(
                         peis_results, ignore_index=True
                     )
@@ -1040,7 +1209,7 @@ if cell_type and cell_label and uploaded_files:
                     ax_peis.set_title(f"Combined PEIS: {cell_label}")
                     ax_peis.grid(True, linestyle=":", alpha=0.6)
                     ax_peis.set_aspect("equal")
-                    n_cols = 2 if len(bundles) > 12 else 1
+                    n_cols = 2 if len(imp_bundles) > 12 else 1
                     ax_peis.legend(
                         loc="upper left",
                         bbox_to_anchor=(1.02, 1),
@@ -1117,7 +1286,7 @@ if cell_type and cell_label and uploaded_files:
                             b = bundles_peis[idx]
                             with cols[j]:
                                 with st.expander(
-                                    f"Run {idx+1}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
+                                    f"Run {b['run_no']}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
                                 ):
                                     st.write("**PEIS Semi-ellipse Fit**")
                                     if b["fig_peis"]:
@@ -1126,7 +1295,7 @@ if cell_type and cell_label and uploaded_files:
                                     st.download_button(
                                         label="Download PEIS fit (PNG)",
                                         data=b["fig_peis"].getvalue(),
-                                        file_name=f"{cell_label}_Run_{idx+1}_PEIS_Plot.png",
+                                        file_name=f"{cell_label}_Run_{b['run_no']}_PEIS_Plot.png",
                                         mime="image/png",
                                         key=f"dl_img_peis_{idx}",
                                     )
@@ -1138,7 +1307,7 @@ if cell_type and cell_label and uploaded_files:
 
         cf_run_files = [
             f
-            for f in mpr_files
+            for f in all_mpr_files
             if "PEIS" not in f.name.upper() and "EIS" not in f.name.upper()
         ]
         if not cf_run_files:
@@ -1162,7 +1331,9 @@ if cell_type and cell_label and uploaded_files:
         )
 
         eis_files = [
-            f for f in mpr_files if "PEIS" in f.name.upper() or "EIS" in f.name.upper()
+            f
+            for f in all_mpr_files
+            if "PEIS" in f.name.upper() or "EIS" in f.name.upper()
         ]
         if not eis_files:
             st.warning("Please upload positive and negative PEIS .mpr files for EIS resistance fitting.")
@@ -1297,7 +1468,7 @@ if cell_type and cell_label and uploaded_files:
             st.warning("Please upload OCV relaxation .mpr files for Diffusion Coefficient analysis.")
             st.stop()
 
-        ocv_candidates = [f for f in mpr_files if "OCV" in f.name.upper()] or mpr_files
+        ocv_candidates = [f for f in all_mpr_files if "OCV" in f.name.upper()] or all_mpr_files
         file_name_map = {f.name: f for f in ocv_candidates}
 
         st.write("### Setup")
