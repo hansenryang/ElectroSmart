@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from galvani import BioLogic
 from PIL import Image
 import base64
+from datetime import datetime, timedelta, timezone
 from typing import Any, IO, Optional
 
 from plotting import (
@@ -96,6 +97,49 @@ def impedance_technique_radio(key: str) -> str:
     )
 
 
+def record_message(kind: str, message: str) -> None:
+    """Keep the text of a message that the page shows in this run.
+
+    Remove the Markdown marks for bold text and for code. The metadata
+    file lists these messages.
+
+    Args:
+        kind: The type of message, "Warning" or "Error".
+        message: The text that the page shows.
+
+    Returns:
+        None.
+    """
+    text = message.replace("**", "").replace("`", "")
+    st.session_state.setdefault("run_messages", []).append(f"{kind}: {text}")
+
+
+def show_warning(message: str) -> None:
+    """Show a warning and record it for the metadata file.
+
+    Args:
+        message: The warning text.
+
+    Returns:
+        None.
+    """
+    st.warning(message)
+    record_message("Warning", message)
+
+
+def show_error(message: str) -> None:
+    """Show an error and record it for the metadata file.
+
+    Args:
+        message: The error text.
+
+    Returns:
+        None.
+    """
+    st.error(message)
+    record_message("Error", message)
+
+
 def get_file_reports(files: list[IO[bytes]]) -> dict[str, FileReport]:
     """Check each uploaded file once and keep the results.
 
@@ -136,13 +180,13 @@ def show_file_warnings(reports: dict[str, FileReport]) -> None:
 
     if empty:
         lines = "\n".join(f"- `{r.name}`: {r.detail}" for r in empty)
-        st.warning(
+        show_warning(
             "**These files are empty.** The app will not use them in EIS Fit, "
             "Preconditioning, or Limiting Current.\n\n" + lines
         )
     if unreadable:
         lines = "\n".join(f"- `{r.name}`: {r.detail}" for r in unreadable)
-        st.warning(
+        show_warning(
             "**galvani cannot read these files.** The app will not use them in "
             "EIS Fit, Preconditioning, or Limiting Current. "
             "Download the .mpr files again from the newest EC-Lab software.\n\n"
@@ -161,7 +205,7 @@ def columns_ok(problems: list[ColumnProblem]) -> bool:
         misses a column.
     """
     for p in problems:
-        st.error(
+        show_error(
             f"**{p.file_name}** does not have the required column(s): "
             f"{', '.join(p.missing)}."
         )
@@ -197,7 +241,7 @@ def show_skipped_runs(bundles: list[dict[str, Any]]) -> None:
                 "impedance analysis."
             )
     if lines:
-        st.warning(
+        show_warning(
             "**The app cannot fully use these runs.**\n\n" + "\n".join(lines)
         )
 
@@ -357,11 +401,186 @@ def fit_current_fraction_eis_resistances(
     return resistances, pd.concat(fit_tables, ignore_index=True)
 
 
+def analysis_time_text() -> str:
+    """Give the current time in the time zone of the browser.
+
+    Read the time zone from Streamlit (st.context). Do not use the
+    time zone of the computer that runs Python. On the Streamlit
+    website, that computer uses UTC. If Streamlit does not give a time
+    zone, use UTC.
+
+    Returns:
+        The date, the time, the UTC offset, and the time zone name,
+        for example "2026-10-09 21:37:05 UTC-07:00 (America/Los_Angeles)".
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        # The offset is UTC minus the local time, in minutes.
+        offset_min = st.context.timezone_offset
+        zone_name = st.context.timezone
+    except Exception:
+        offset_min = None
+        zone_name = None
+    if offset_min is None:
+        return now.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+
+    local = now.astimezone(timezone(timedelta(minutes=-offset_min)))
+    text = local.strftime("%Y-%m-%d %H:%M:%S") + " " + local.strftime("UTC%z")
+    text = text[:-2] + ":" + text[-2:]
+    return f"{text} ({zone_name})" if zone_name else text
+
+
+def build_metadata_text(
+    analysis: str,
+    cell_type: str,
+    cell_label: str,
+    sections: list[tuple[str, list[tuple[str, Any]]]],
+) -> str:
+    """Build the metadata text for one analysis.
+
+    Call this function when the analysis runs. Write a header with the
+    ElectroSmart version, the analysis name, the time of the analysis,
+    the cell type, and the cell label. Then write each section as a
+    title and a list of "name: value" lines. Skip a section that has
+    no lines.
+
+    Args:
+        analysis: The name of the analysis.
+        cell_type: The type of cell under test.
+        cell_label: The label of the cell under test.
+        sections: A list of (title, lines) pairs. Each line is a
+            (name, value) pair.
+
+    Returns:
+        The metadata text, with CRLF line endings. The function
+        current_metadata_text adds the uploaded files and the warnings
+        at download.
+    """
+    title = "ElectroSmart Analysis Metadata"
+    lines = [
+        title,
+        "=" * len(title),
+        f"ElectroSmart Version: {version}",
+        f"Analysis: {analysis}",
+        f"Time of Analysis: {analysis_time_text()}",
+        f"Cell Type: {cell_type}",
+        f"Cell Label: {cell_label}",
+    ]
+    for section_title, entries in sections:
+        if not entries:
+            continue
+        lines += ["", section_title, "-" * len(section_title)]
+        lines += [f"{name}: {value}" for name, value in entries]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def eis_fit_metadata(
+    technique: str, fit_choice: str, discard_left: int, discard_right: int
+) -> list[tuple[str, Any]]:
+    """List the EIS fit settings for a metadata file.
+
+    Give the value of each EIS fit widget. Do not add other text.
+
+    Args:
+        technique: The chosen impedance fit technique.
+        fit_choice: The chosen ellipse fit mode.
+        discard_left: The number of points to discard from the left.
+        discard_right: The number of points to discard from the right.
+
+    Returns:
+        A list of (name, value) pairs.
+    """
+    return [
+        ("Technique", technique),
+        ("Points to discard (left)", int(discard_left)),
+        ("Points to discard (right)", int(discard_right)),
+        ("Fit Choice", fit_choice),
+    ]
+
+
+def current_metadata_text(meta_key: str) -> str:
+    """Complete the stored metadata text with the state of the page.
+
+    Start with the text that the analysis stored. Add the names of all
+    uploaded MPR files. Add each warning and error that the page shows
+    in this run, above the download button.
+
+    Args:
+        meta_key: The session state key that holds the metadata text.
+
+    Returns:
+        The full metadata text, with CRLF line endings.
+    """
+    lines = ["", "All Uploaded .mpr Files", "-----------------------"]
+    lines += st.session_state.get("run_uploaded_names", []) or ["None"]
+
+    title = "Warnings Shown at Download"
+    lines += ["", title, "-" * len(title)]
+    messages = st.session_state.get("run_messages", [])
+    if not messages:
+        lines.append("None")
+    for number, message in enumerate(messages, start=1):
+        parts = [p.strip() for p in message.splitlines() if p.strip()]
+        lines.append(f"{number}. {parts[0]}")
+        lines += [f"   {p}" for p in parts[1:]]
+    return st.session_state[meta_key] + "\r\n".join(lines) + "\r\n"
+
+
+def add_metadata_to_zip(zip_bytes: bytes, file_name: str, meta_key: str) -> bytes:
+    """Add the current metadata text file to a stored ZIP file.
+
+    Args:
+        zip_bytes: The content of the stored ZIP file.
+        file_name: The name of the TXT file in the ZIP file.
+        meta_key: The session state key that holds the metadata text.
+
+    Returns:
+        The content of the new ZIP file. Return the stored content if
+        the analysis did not store its metadata.
+    """
+    if meta_key not in st.session_state:
+        return zip_bytes
+    zip_buf = io.BytesIO(zip_bytes)
+    with zipfile.ZipFile(zip_buf, "a") as zf:
+        zf.writestr(file_name, current_metadata_text(meta_key))
+    return zip_buf.getvalue()
+
+
+def metadata_download_button(
+    meta_key: str, file_name: str, container: Any = st
+) -> None:
+    """Show a download button for the stored metadata of one analysis.
+
+    Show nothing if the analysis did not store its metadata. The widget
+    key starts with "metadata_btn_". The page style uses this key to
+    make the button purple.
+
+    Args:
+        meta_key: The session state key that holds the metadata text.
+        file_name: The name of the TXT file to download.
+        container: The Streamlit column or container that holds the
+            button.
+
+    Returns:
+        None.
+    """
+    if meta_key not in st.session_state:
+        return
+    container.download_button(
+        "Download Metadata (TXT)",
+        current_metadata_text(meta_key),
+        file_name,
+        "text/plain",
+        key=f"metadata_btn_{meta_key}",
+    )
+
+
 def build_eis_analysis_zip(key_list: list[str]) -> bytes:
     """Build a ZIP file of EIS overview and fit results.
 
     Bundle the overview plot, the summary CSV, the trend plot, and the
-    cycle plots for each key in key_list. Used by both the single-file
+    cycle plots for each key in key_list. The display adds the metadata
+    text file at download. Used by both the single-file
     EIS view (key_list=["Single"]) and the Preconditioning view
     (key_list=["Positive", "Negative"]).
 
@@ -449,11 +668,17 @@ def run_eis_analysis(
         st.session_state[f"fit_cycles_{key}"] = cyc_imgs
 
 
-def display_eis_analysis(keys: list[str], cell_label: str, zip_key: str) -> None:
+def display_eis_analysis(
+    keys: list[str],
+    cell_label: str,
+    zip_key: str,
+    meta_key: str,
+    show_metadata_button: bool = True,
+) -> None:
     """Show the stored EIS overview and fit results for the given keys.
 
-    Show a combined download button, then show the overview plot and
-    fit plot for each key. `keys` is ["Single"] for the single-file
+    Show a combined download button and a metadata download button,
+    then show the overview plot and fit plot for each key. `keys` is ["Single"] for the single-file
     view or ["Positive", "Negative"] for Preconditioning; the layout
     adapts to however many keys are passed.
 
@@ -463,6 +688,10 @@ def display_eis_analysis(keys: list[str], cell_label: str, zip_key: str) -> None
         cell_label: The label of the cell under test.
         zip_key: The session state key that holds the combined ZIP
             file.
+        meta_key: The session state key that holds the metadata text.
+        show_metadata_button: Show the metadata download button below
+            the overview plots. Set this to False if the caller shows
+            the button in a different position.
 
     Returns:
         None.
@@ -475,7 +704,9 @@ def display_eis_analysis(keys: list[str], cell_label: str, zip_key: str) -> None
 
     st.download_button(
         "📦 Download All EIS Analysis Files (ZIP)",
-        st.session_state[zip_key],
+        add_metadata_to_zip(
+            st.session_state[zip_key], f"{cell_label}_Full_Metadata.txt", meta_key
+        ),
         f"{cell_label}_Full_Analysis.zip",
         "application/zip",
         width="stretch",
@@ -494,6 +725,9 @@ def display_eis_analysis(keys: list[str], cell_label: str, zip_key: str) -> None
                     "image/png",
                     key=f"btn_{key}",
                 )
+
+    if show_metadata_button:
+        metadata_download_button(meta_key, f"{cell_label}_Full_Metadata.txt")
 
     st.divider()
 
@@ -534,6 +768,8 @@ def build_limiting_impedance_zip(
 ) -> bytes:
     """Build a ZIP file of Limiting Current impedance results.
 
+    Always include the metadata text file.
+
     Args:
         cell_label: The label of the cell under test.
         include_summary: Include the combined plot and CSV.
@@ -544,6 +780,12 @@ def build_limiting_impedance_zip(
     """
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
+        if "lim_meta_peis" in st.session_state:
+            zf.writestr(
+                f"{cell_label}_Limiting_Current_Impedance_Metadata.txt",
+                current_metadata_text("lim_meta_peis"),
+            )
+
         if include_summary:
             if "img_LC_PEIS_all" in st.session_state:
                 zf.writestr(
@@ -718,6 +960,13 @@ st.markdown(
         border-color: #09ab3b !important;
     }
 
+    div[class*="st-key-metadata_btn_"] div[data-testid="stDownloadButton"] > button,
+    div[class*="st-key-metadata_btn_"] div[data-testid="stDownloadButton"] > button:hover {
+        background-color: #7c3aed !important;
+        color: #ffffff !important;
+        border-color: #7c3aed !important;
+    }
+
     div[data-testid="stButton"] > button[kind="primary"],
     div[data-testid="stButton"] > button[kind="primary"]:hover {
         background-color: #f63366 !important;
@@ -766,6 +1015,9 @@ if st.button("Clear files", key="clear_files_button", type="primary"):
     st.session_state.uploader_key += 1
     st.rerun()
 
+st.session_state["run_messages"] = []
+st.session_state["run_uploaded_names"] = [f.name for f in uploaded_files or []]
+
 file_reports = get_file_reports(uploaded_files) if uploaded_files else {}
 show_file_warnings(file_reports)
 
@@ -774,7 +1026,7 @@ if not (cell_type and cell_label and uploaded_files):
     cell_label_indicator = " cell label," if not (cell_label) else ""
     file_indicator = " file upload." if not (uploaded_files) else ""
 
-    st.warning(
+    show_warning(
         f"Please input{cell_type_indicator}{cell_label_indicator}{file_indicator}"
     )
 
@@ -814,7 +1066,7 @@ if cell_type and cell_label and uploaded_files:
         f for f in uploaded_files if file_reports[f.name].status == STATUS_OK
     ]
     if not mpr_files:
-        st.error("None of the uploaded files can be used. See the warnings above.")
+        show_error("None of the uploaded files can be used. See the warnings above.")
         st.stop()
 
     st.divider()
@@ -832,12 +1084,12 @@ if cell_type and cell_label and uploaded_files:
 
     if analysis_type == "EIS Fit (Single File)":
         if not mpr_files:
-            st.warning("Please upload .mpr files for EIS analysis.")
+            show_warning("Please upload .mpr files for EIS analysis.")
             st.stop()
 
         peis_files = [f for f in mpr_files if "PEIS" in f.name]
         if not peis_files:
-            st.warning("No PEIS files detected. Please upload at least one PEIS .mpr file.")
+            show_warning("No PEIS files detected. Please upload at least one PEIS .mpr file.")
             st.stop()
 
         peis_file_names = [f.name for f in peis_files]
@@ -857,7 +1109,7 @@ if cell_type and cell_label and uploaded_files:
         tech = impedance_technique_radio("single_impedance_technique")
 
         if tech == "Linear fit":
-            st.warning("This technique is not yet supported.")
+            show_warning("This technique is not yet supported.")
 
         if tech == "Semi-ellipse fit":
             discard_left, discard_right = get_discard_parameters()
@@ -876,19 +1128,35 @@ if cell_type and cell_label and uploaded_files:
                         discard_right,
                         fit_choice,
                     )
+                    st.session_state["fit_meta_single"] = build_metadata_text(
+                        "EIS Fit (Single File)",
+                        cell_type,
+                        cell_label,
+                        [
+                            ("Files Used in This Analysis", [("PEIS File", single_peis_name)]),
+                            (
+                                "EIS Fitting",
+                                eis_fit_metadata(
+                                    tech, fit_choice, discard_left, discard_right
+                                ),
+                            ),
+                        ],
+                    )
                     st.session_state["fit_zip_single"] = build_eis_analysis_zip(["Single"])
                     st.toast("EIS analysis complete!", icon="✅")
 
-            display_eis_analysis(["Single"], cell_label, "fit_zip_single")
+            display_eis_analysis(
+                ["Single"], cell_label, "fit_zip_single", "fit_meta_single"
+            )
 
     if analysis_type == "Preconditioning":
         if not mpr_files:
-            st.warning("Please upload .mpr files for Preconditioning analysis.")
+            show_warning("Please upload .mpr files for Preconditioning analysis.")
             st.stop()
 
         peis_files = [f for f in mpr_files if "PEIS" in f.name]
         if not peis_files:
-            st.warning("No PEIS files detected. Please upload at least two PEIS .mpr files.")
+            show_warning("No PEIS files detected. Please upload at least two PEIS .mpr files.")
             st.stop()
 
         peis_file_names = [f.name for f in peis_files]
@@ -911,7 +1179,7 @@ if cell_type and cell_label and uploaded_files:
 
         precond_same_file = pos_peis_name == neg_peis_name
         if precond_same_file:
-            st.warning(
+            show_warning(
                 "Positive and Negative PEIS files must be different. "
                 "Please select a distinct file for each polarity."
             )
@@ -928,13 +1196,16 @@ if cell_type and cell_label and uploaded_files:
             tech = impedance_technique_radio("preconditioning_impedance_technique")
 
             if tech == "Linear fit":
-                st.warning("This technique is not yet supported.")
+                show_warning("This technique is not yet supported.")
 
             if tech == "Semi-ellipse fit":
                 discard_left, discard_right = get_discard_parameters()
                 fit_choice = single_or_dual_ellipse("preconditioning_fit_choice")
 
-                if st.button("Generate EIS Plots", key="precond_generate_button"):
+                generate_col, metadata_col, _ = st.columns([1, 1, 3])
+                if generate_col.button(
+                    "Generate EIS Plots", key="precond_generate_button"
+                ):
                     with st.spinner(
                         f"Analyzing Positive and Negative PEIS for {cell_label}... This may take a moment."
                     ):
@@ -947,16 +1218,50 @@ if cell_type and cell_label and uploaded_files:
                             discard_right,
                             fit_choice,
                         )
+                        st.session_state["fit_meta_precond"] = build_metadata_text(
+                            "Preconditioning",
+                            cell_type,
+                            cell_label,
+                            [
+                                (
+                                    "Files Used in This Analysis",
+                                    [
+                                        ("Positive PEIS File", pos_peis_name),
+                                        ("Negative PEIS File", neg_peis_name),
+                                    ],
+                                ),
+                                (
+                                    "EIS Fitting",
+                                    eis_fit_metadata(
+                                        tech, fit_choice, discard_left, discard_right
+                                    ),
+                                ),
+                            ],
+                        )
                         st.session_state["fit_zip_precond"] = build_eis_analysis_zip(
                             ["Positive", "Negative"]
                         )
                         st.toast("EIS analysis complete!", icon="✅")
 
-                display_eis_analysis(["Positive", "Negative"], cell_label, "fit_zip_precond")
+                # Draw this button after the analysis, so that it shows
+                # immediately. It goes in the column next to Generate.
+                metadata_download_button(
+                    "fit_meta_precond",
+                    f"{cell_label}_Full_Metadata.txt",
+                    metadata_col,
+                )
+
+                display_eis_analysis(
+                    ["Positive", "Negative"],
+                    cell_label,
+                    "fit_zip_precond",
+                    "fit_meta_precond",
+                    show_metadata_button=False,
+                )
 
     if analysis_type == "Limiting Current":
         if not mpr_files:
-            st.warning("Please upload .mpr files for Limiting Current analysis.")
+            show_warning("Please upload .mpr files for Limiting Current analysis.")
             st.stop()
 
         st.write("### Setup")
@@ -988,7 +1293,7 @@ if cell_type and cell_label and uploaded_files:
         st.write("#### A. Confirm Runs")
 
         if not bundles:
-            st.warning("No CP/OCV/PEIS run bundles were detected.")
+            show_warning("No CP/OCV/PEIS run bundles were detected.")
 
         if st.button("Confirm", disabled=not pot_bundles):
             with st.spinner("Preparing run confirmation plots ..."):
@@ -1042,6 +1347,32 @@ if cell_type and cell_label and uploaded_files:
                     st.session_state["fname_sands_png"] = f"{cell_label}_Sands_Fit.png"
                     st.session_state["img_sands_fit"] = buf_sands
 
+                pot_inputs = [
+                    ("Active Area (cm^2)", active_area),
+                    ("Electrolyte Thickness (cm)", elyt_thickness),
+                ]
+                if not s_df.empty:
+                    pot_inputs.append(("Diffusion Coefficient (cm^2/s)", diff_coeff))
+                st.session_state["lim_meta_cp"] = build_metadata_text(
+                    "Limiting Current - Potentiometric Data",
+                    cell_type,
+                    cell_label,
+                    [
+                        (
+                            "Files Used in This Analysis",
+                            [
+                                (
+                                    f"Run {b['run_no']} "
+                                    f"({b['Current Density (mA/cm²)']:.3f} mA/cm^2)",
+                                    f"CP = {b['f_cp'].name}",
+                                )
+                                for b in confirmed_bundles
+                            ],
+                        ),
+                        ("Input Parameters", pot_inputs),
+                    ],
+                )
+
                 st.toast("Processing of Potentiometric Data is complete!", icon="✅")
 
         if "lim_bundles_cp" in st.session_state:
@@ -1062,6 +1393,11 @@ if cell_type and cell_label and uploaded_files:
                         st.session_state["img_sands_fit"].getvalue(),
                     )
                 zf.writestr(st.session_state["fname_polarization"], polarization_csv)
+                if "lim_meta_cp" in st.session_state:
+                    zf.writestr(
+                        f"{cell_label}_Limiting_Current_Potentiometric_Metadata.txt",
+                        current_metadata_text("lim_meta_cp"),
+                    )
 
             st.download_button(
                 "📂 Download Summary Potentiometric Data (ZIP)",
@@ -1091,7 +1427,13 @@ if cell_type and cell_label and uploaded_files:
                 st.image(st.session_state["img_sands_fit"])
 
             # --- Summary Download Buttons ---
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
+
+            metadata_download_button(
+                "lim_meta_cp",
+                f"{cell_label}_Limiting_Current_Potentiometric_Metadata.txt",
+                c5,
+            )
 
             c1.download_button(
                 label="Download all CP Plot PNG",
@@ -1136,7 +1478,7 @@ if cell_type and cell_label and uploaded_files:
         tech = impedance_technique_radio("limiting_current_impedance_technique")
 
         if tech == "Linear fit":
-            st.warning("This technique is not yet supported.")
+            show_warning("This technique is not yet supported.")
 
         if tech == "Semi-ellipse fit":
 
@@ -1225,6 +1567,36 @@ if cell_type and cell_label and uploaded_files:
                     plt.close(fig_peis_all)
                     st.session_state["img_LC_PEIS_all"] = peis_plot_buf
 
+                    st.session_state["lim_meta_peis"] = build_metadata_text(
+                        "Limiting Current - Impedance Data",
+                        cell_type,
+                        cell_label,
+                        [
+                            (
+                                "Files Used in This Analysis",
+                                [
+                                    (
+                                        f"Run {b['run_no']} "
+                                        f"({b['Current Density (mA/cm²)']:.3f} mA/cm^2)",
+                                        f"PEIS = {b['f_peis'].name}; "
+                                        f"CP = {b['f_cp'].name}",
+                                    )
+                                    for b in imp_bundles
+                                ],
+                            ),
+                            (
+                                "Input Parameters",
+                                [("Active Area (cm^2)", active_area)],
+                            ),
+                            (
+                                "EIS Fitting",
+                                eis_fit_metadata(
+                                    tech, fit_choice, discard_left, discard_right
+                                ),
+                            ),
+                        ],
+                    )
+
                     st.toast("Processing of Impedance Data is complete!", icon="✅")
 
             if "lim_bundles_peis" in st.session_state:
@@ -1252,7 +1624,13 @@ if cell_type and cell_label and uploaded_files:
 
                 peis_all_df = st.session_state["peis_summary_all"]
 
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
+
+                metadata_download_button(
+                    "lim_meta_peis",
+                    f"{cell_label}_Limiting_Current_Impedance_Metadata.txt",
+                    c4,
+                )
 
                 c1.download_button(
                     label=f"Download {cell_label} Combined PEIS Plot (PNG)",
@@ -1303,7 +1681,7 @@ if cell_type and cell_label and uploaded_files:
 
     if analysis_type == "Current Fraction":
         if not mpr_files:
-            st.warning("Please upload .mpr files for Current Fraction analysis.")
+            show_warning("Please upload .mpr files for Current Fraction analysis.")
             st.stop()
 
         cf_run_files = [
@@ -1312,7 +1690,7 @@ if cell_type and cell_label and uploaded_files:
             if "PEIS" not in f.name.upper() and "EIS" not in f.name.upper()
         ]
         if not cf_run_files:
-            st.warning("Please upload CA/OCV .mpr files for Current Fraction analysis.")
+            show_warning("Please upload CA/OCV .mpr files for Current Fraction analysis.")
             st.stop()
 
         st.write("### Setup")
@@ -1337,7 +1715,7 @@ if cell_type and cell_label and uploaded_files:
             if "PEIS" in f.name.upper() or "EIS" in f.name.upper()
         ]
         if not eis_files:
-            st.warning("Please upload positive and negative PEIS .mpr files for EIS resistance fitting.")
+            show_warning("Please upload positive and negative PEIS .mpr files for EIS resistance fitting.")
             st.stop()
 
         eis_file_names = [f.name for f in eis_files]
@@ -1360,7 +1738,7 @@ if cell_type and cell_label and uploaded_files:
 
         eis_same_file = pos_eis_name == neg_eis_name
         if eis_same_file:
-            st.warning(
+            show_warning(
                 "Positive and Negative PEIS files must be different. "
                 "Please select a distinct file for each polarity."
             )
@@ -1398,6 +1776,45 @@ if cell_type and cell_label and uploaded_files:
                         eis_fit_df.to_excel(writer, sheet_name="EIS_Fits", index=False)
                     excel_buf.seek(0)
 
+
+                    cf_files = [
+                        ("Positive PEIS File", pos_eis_name),
+                        ("Negative PEIS File", neg_eis_name),
+                    ]
+                    for _, trial in raw_df.iterrows():
+                        cf_files.append(
+                            (f"{trial['experiment']} OCV File", trial["ocv_file"])
+                        )
+                        cf_files.append(
+                            (f"{trial['experiment']} CA File(s)", trial["ca_files"])
+                        )
+                    st.session_state["cf_meta"] = build_metadata_text(
+                        "Current Fraction",
+                        cell_type,
+                        cell_label,
+                        [
+                            ("Files Used in This Analysis", cf_files),
+                            (
+                                "Input Parameters",
+                                [
+                                    (
+                                        "Points from the end to average",
+                                        int(avg_points),
+                                    ),
+                                    ("I,ss method", iss_method),
+                                ],
+                            ),
+                            (
+                                "EIS Fitting",
+                                eis_fit_metadata(
+                                    "Semi-ellipse fit",
+                                    fit_choice,
+                                    discard_left,
+                                    discard_right,
+                                ),
+                            ),
+                        ],
+                    )
                     zip_buf = io.BytesIO()
                     with zipfile.ZipFile(zip_buf, "w") as zf:
                         zf.writestr(f"{cell_label}_current_fraction_summary.csv", csv_buf.getvalue())
@@ -1418,13 +1835,18 @@ if cell_type and cell_label and uploaded_files:
                     st.session_state["cf_avg_rho"] = avg_rho
                     st.toast("Current Fraction analysis complete!", icon="✅")
                 except Exception as exc:
-                    st.error(f"Current Fraction analysis failed: {exc}")
+                    show_error(f"Current Fraction analysis failed: {exc}")
 
         if "cf_summary_df" in st.session_state:
 
+            cf_zip_with_metadata = add_metadata_to_zip(
+                st.session_state["cf_zip"],
+                f"{cell_label}_current_fraction_metadata.txt",
+                "cf_meta",
+            )
             st.download_button(
                 "📦 Download All Current Fraction Files (ZIP)",
-                st.session_state["cf_zip"],
+                cf_zip_with_metadata,
                 f"{cell_label}_current_fraction_analysis.zip",
                 "application/zip",
                 width="stretch",
@@ -1438,7 +1860,10 @@ if cell_type and cell_label and uploaded_files:
                 st.write("#### EIS Fit Resistances")
                 st.dataframe(st.session_state["cf_eis_fit_df"], width="stretch")
 
-            d1, d2, d3, d4 = st.columns(4)
+            d1, d2, d3, d4, d5 = st.columns(5)
+            metadata_download_button(
+                "cf_meta", f"{cell_label}_current_fraction_metadata.txt", d5
+            )
             d1.download_button(
                 "Download CSV",
                 st.session_state["cf_csv"],
@@ -1459,14 +1884,14 @@ if cell_type and cell_label and uploaded_files:
             )
             d4.download_button(
                 "Download ZIP",
-                st.session_state["cf_zip"],
+                cf_zip_with_metadata,
                 f"{cell_label}_current_fraction_analysis.zip",
                 "application/zip",
             )
 
     if analysis_type == "Diffusion Coefficient":
         if not mpr_files:
-            st.warning("Please upload OCV relaxation .mpr files for Diffusion Coefficient analysis.")
+            show_warning("Please upload OCV relaxation .mpr files for Diffusion Coefficient analysis.")
             st.stop()
 
         ocv_candidates = [f for f in all_mpr_files if "OCV" in f.name.upper()] or all_mpr_files
@@ -1509,7 +1934,7 @@ if cell_type and cell_label and uploaded_files:
         if st.button("Analyze Diffusion Coefficient"):
             selected_files = [file_name_map[name] for name in selected_ocv_names]
             if not selected_files:
-                st.warning("Please select at least one OCV relaxation file.")
+                show_warning("Please select at least one OCV relaxation file.")
             else:
                 with st.spinner("Fitting OCV relaxation data..."):
                     try:
@@ -1536,6 +1961,28 @@ if cell_type and cell_label and uploaded_files:
                             fit_df.to_excel(writer, sheet_name="Fit_Curves", index=False)
                         excel_buf.seek(0)
 
+                        st.session_state["diffusion_meta"] = build_metadata_text(
+                            "Diffusion Coefficient",
+                            cell_type,
+                            cell_label,
+                            [
+                                (
+                                    "Files Used in This Analysis",
+                                    [
+                                        (f"OCV Relaxation File {n}", f.name)
+                                        for n, f in enumerate(selected_files, start=1)
+                                    ],
+                                ),
+                                (
+                                    "Input Parameters",
+                                    [
+                                        ("Thickness (um)", thickness_um),
+                                        ("Cutoff Time (h)", cutoff_time_h),
+                                        ("Alpha", alpha),
+                                    ],
+                                ),
+                            ],
+                        )
                         zip_buf = io.BytesIO()
                         with zipfile.ZipFile(zip_buf, "w") as zf:
                             zf.writestr(
@@ -1569,7 +2016,7 @@ if cell_type and cell_label and uploaded_files:
                         st.session_state["diffusion_zip"] = zip_buf.getvalue()
                         st.toast("Diffusion coefficient analysis complete!", icon="✅")
                     except Exception as exc:
-                        st.error(f"Diffusion coefficient analysis failed: {exc}")
+                        show_error(f"Diffusion coefficient analysis failed: {exc}")
 
         if "diffusion_results_df" in st.session_state:
             st.write("### Diffusion Coefficient Results")
@@ -1583,7 +2030,10 @@ if cell_type and cell_label and uploaded_files:
                 st.write("#### Log |V - V_inf| vs Time")
                 st.image(st.session_state["diffusion_log_buf"])
 
-            dl1, dl2, dl3, dl4 = st.columns(4)
+            dl1, dl2, dl3, dl4, dl5 = st.columns(5)
+            metadata_download_button(
+                "diffusion_meta", f"{cell_label}_diffusion_metadata.txt", dl5
+            )
             dl1.download_button(
                 "Download Summary CSV",
                 st.session_state["diffusion_csv"],
@@ -1598,7 +2048,11 @@ if cell_type and cell_label and uploaded_files:
             )
             dl3.download_button(
                 "Download Plots ZIP",
-                st.session_state["diffusion_zip"],
+                add_metadata_to_zip(
+                    st.session_state["diffusion_zip"],
+                    f"{cell_label}_diffusion_metadata.txt",
+                    "diffusion_meta",
+                ),
                 f"{cell_label}_diffusion_analysis.zip",
                 "application/zip",
             )
