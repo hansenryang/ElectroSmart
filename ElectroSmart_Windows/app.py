@@ -35,7 +35,7 @@ from validation import (
     inspect_mpr_file,
 )
 
-version = 4.4
+version = 4.5
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
