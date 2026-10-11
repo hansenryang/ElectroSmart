@@ -739,6 +739,7 @@ def display_eis_analysis(
                     continue
                 st.subheader(f"{key} Fit")
                 st.image(st.session_state[f"fit_fig_{key}"])
+                st.dataframe(st.session_state[f"fit_df_{key}"], width="stretch", hide_index=True)
 
                 c_dl1, c_dl2 = st.columns(2)
                 c_dl1.download_button(
@@ -1520,6 +1521,8 @@ if cell_type and cell_label and uploaded_files:
                                 "R_bulk",
                                 "R_i",
                                 "R_bulk + R_i",
+                                "R_bulk_arc",
+                                "R_i_arc",
                             ]
                         ]
                         peis_results.append(fit_df)

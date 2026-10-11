@@ -351,6 +351,8 @@ def semiellipse_fit(
             xc2 = yc2 = Rx2 = Ry2 = np.nan
         r_bulk = r_bulk_raw if r_bulk_raw >= 0 else x_fit[0]
         ri = r_total_raw - r_bulk
+        r_bulk_arc = np.min(x_fit)
+        ri_arc = r_total_raw - r_bulk_arc
         fig_ind = plt.figure(figsize=(8, 4))
         plt.scatter(
             df_clean.iloc[:, 0], df_clean.iloc[:, 1], color="lightgray", alpha=0.3
@@ -383,7 +385,14 @@ def semiellipse_fit(
         fig_ind.clear()
         plt.close(fig_ind)
         results_list.append(
-            {"Cycle": int(c), "R_bulk": r_bulk, "R_i": ri, "R_total": r_total_raw}
+            {
+                "Cycle": int(c),
+                "R_bulk": r_bulk,
+                "R_i": ri,
+                "R_total": r_total_raw,
+                "R_bulk_arc": r_bulk_arc,
+                "R_i_arc": ri_arc,
+            }
         )
     summary_df = pd.DataFrame(results_list).sort_values(by="Cycle")
     fig_sum, ax1 = plt.subplots(figsize=(10, 5))
