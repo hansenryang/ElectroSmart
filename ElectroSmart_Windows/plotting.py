@@ -257,6 +257,121 @@ def find_both_mins(df: pd.DataFrame, peak_idx: int) -> tuple[int, int]:
     return left_min_idx, right_min_idx
 
 
+def sigmoid(z: float) -> float:
+    """Compute the logistic function of a value.
+
+    Args:
+        z: The input value.
+
+    Returns:
+        A value between 0 and 1.
+    """
+    return 0.5 * (1 + np.tanh(0.5 * z))
+
+
+def arc_to_ellipse(params: Any) -> tuple[float, float, float, float]:
+    """Convert arc fit parameters to ellipse parameters.
+
+    The arc parameters keep the fit physical. The left intercept is not
+    negative. The arc height is not larger than the arc half-width
+    (Ry <= Rx). The center is on or below the axis, so the upper half
+    of the ellipse crosses -Im(Z) = 0 at both intercepts.
+
+    Args:
+        params: The arc parameters a, b, u, v. The left intercept is
+            |a|. The width between the intercepts is exp(b). The ratio
+            Ry / Rx is sigmoid(u). The ratio -yc / Ry is
+            0.95 * sigmoid(v).
+
+    Returns:
+        The ellipse parameters xc, yc, Rx, Ry.
+    """
+    a, b, u, v = params
+    x_left = abs(a)
+    width = np.exp(np.clip(b, -50, 50))
+    s = sigmoid(u)
+    t = 0.95 * sigmoid(v)
+    rx = width / (2 * np.sqrt(1 - t**2))
+    ry = s * rx
+    return x_left + width / 2, -t * ry, rx, ry
+
+
+def arc_guess(x_left: float, x_right: float, height: float) -> list[float]:
+    """Make the first arc parameters for a fit.
+
+    Args:
+        x_left: The first guess of the left intercept.
+        x_right: The first guess of the right intercept.
+        height: The first guess of the arc height.
+
+    Returns:
+        The arc parameters a, b, u, v. See arc_to_ellipse.
+    """
+    width = max(x_right - x_left, 1e-9)
+    t = 0.1
+    rx = width / (2 * np.sqrt(1 - t**2))
+    s = float(np.clip(height / ((1 - t) * rx), 0.05, 0.9))
+    q = t / 0.95
+    return [x_left, np.log(width), np.log(s / (1 - s)), np.log(q / (1 - q))]
+
+
+def obj_one_arc(params: Any, x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a one-arc fit.
+
+    Args:
+        params: The arc parameters. See arc_to_ellipse.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors.
+    """
+    return obj_one_ellipse(list(arc_to_ellipse(params)), x, y)
+
+
+def obj_two_arcs(params: Any, x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a two-arc fit.
+
+    Args:
+        params: The arc parameters of the first arc, and then the arc
+            parameters of the second arc. See arc_to_ellipse.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors.
+    """
+    ellipses = list(arc_to_ellipse(params[:4])) + list(arc_to_ellipse(params[4:]))
+    return obj_two_ellipses(ellipses, x, y)
+
+
+def select_dual_intercepts(
+    ell1: tuple[float, float, float, float],
+    ell2: tuple[float, float, float, float],
+    x_left_min: float,
+    x_right_min: float,
+) -> tuple[float, float]:
+    """Choose R_bulk and R_total from the intercepts of two ellipses.
+
+    R_bulk is the left intercept nearest to the left valley. R_total is
+    the right intercept nearest to the right valley.
+
+    Args:
+        ell1: The parameters xc, yc, Rx, Ry of the first ellipse.
+        ell2: The parameters xc, yc, Rx, Ry of the second ellipse.
+        x_left_min: The Re(Z) value of the left valley.
+        x_right_min: The Re(Z) value of the right valley.
+
+    Returns:
+        R_bulk and R_total.
+    """
+    l1, r1 = solve_ellipse_xints(*ell1)
+    l2, r2 = solve_ellipse_xints(*ell2)
+    r_bulk = l1 if abs(l1 - x_left_min) <= abs(l2 - x_left_min) else l2
+    r_total = r1 if abs(r1 - x_right_min) <= abs(r2 - x_right_min) else r2
+    return r_bulk, r_total
+
+
 def semiellipse_fit(
     cell_type: str,
     cell_label: str,
@@ -272,8 +387,9 @@ def semiellipse_fit(
 
     For each cycle, trim points near the ends. Fit a single ellipse and
     a two-ellipse model. Choose the model with the lower BIC score,
-    unless the caller forces one model. Compute R_bulk and R_i from the
-    fit. Plot each cycle fit and the trend across cycles.
+    unless the caller forces one model. R_bulk and R_total are
+    x-intercepts of a fitted ellipse. Compute R_i from them. Plot each
+    cycle fit and the trend across cycles.
 
     Args:
         cell_type: The type of analysis, for example "Preconditioning".
@@ -305,6 +421,8 @@ def semiellipse_fit(
         df_clean = df_cycle[["Re(Z)/Ohm", "-Im(Z)/Ohm"]]
         no_rows = len(df_clean)
         l_idx, r_idx = find_both_mins(df_clean, peak_idx=no_rows // 4)
+        x_left_min = df_clean.iloc[l_idx, 0]
+        x_right_min = df_clean.iloc[r_idx, 0]
         if no_rows > 10:
             l_idx += no_left_idx_to_throw
             r_idx -= no_right_idx_to_throw
@@ -316,57 +434,74 @@ def semiellipse_fit(
         y_fit = df_masked.iloc[:, 1].values
         n = len(x_fit)
         start_val, end_val = x_fit[0], x_fit[-1]
+        span = end_val - start_val
+        y_max = np.max(y_fit)
         res_one = fmin(
-            obj_one_ellipse,
-            [(start_val + end_val) / 2, 0, (end_val - start_val) / 2, np.max(y_fit)],
+            obj_one_arc,
+            arc_guess(start_val, end_val, y_max),
             args=(x_fit, y_fit),
             disp=False,
+            maxiter=4000,
+            maxfun=8000,
         )
-        bic_one = calculate_bic(obj_one_ellipse(res_one, x_fit, y_fit), n, 4)
+        bic_one = calculate_bic(obj_one_arc(res_one, x_fit, y_fit), n, 4)
+        # Start the two-arc fit from two side-by-side arcs, and from a
+        # normal arc inside a wide arc. Keep the better result.
         mid_x = (start_val + end_val) / 2
-        guess_two = [
-            (start_val + mid_x) / 2,
-            0,
-            (mid_x - start_val) / 2,
-            np.max(y_fit) * 0.5,
-            (mid_x + end_val) / 2,
-            0,
-            (end_val - mid_x) / 2,
-            np.max(y_fit),
+        guesses_two = [
+            arc_guess(start_val, mid_x, y_max * 0.5) + arc_guess(mid_x, end_val, y_max),
+            arc_guess(start_val, end_val, y_max)
+            + arc_guess(start_val - 0.5 * span, end_val + 0.5 * span, y_max * 0.6),
         ]
-        res_two = fmin(
-            obj_two_ellipses, guess_two, args=(x_fit, y_fit), disp=False, maxiter=2000
+        fits_two = [
+            fmin(
+                obj_two_arcs,
+                g,
+                args=(x_fit, y_fit),
+                disp=False,
+                maxiter=8000,
+                maxfun=16000,
+            )
+            for g in guesses_two
+        ]
+        res_two = min(fits_two, key=lambda p: obj_two_arcs(p, x_fit, y_fit))
+        bic_two = calculate_bic(obj_two_arcs(res_two, x_fit, y_fit), n, 8)
+        ellipses = [arc_to_ellipse(res_two[:4]), arc_to_ellipse(res_two[4:])]
+        # Reject a two-arc fit if an arc covers fewer than 3 fit points.
+        dual_ok = all(
+            np.sum((x_fit >= el) & (x_fit <= er)) >= 3
+            for el, er in (solve_ellipse_xints(*ell) for ell in ellipses)
         )
-        bic_two = calculate_bic(obj_two_ellipses(res_two, x_fit, y_fit), n, 8)
-        use_dual = (bic_two < bic_one or must_use_dual) and not must_use_single
+        use_dual = (
+            must_use_dual or (bic_two < bic_one and dual_ok)
+        ) and not must_use_single
         if use_dual:
-            xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = res_two
-            l1, r1 = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            l2, r2 = solve_ellipse_xints(xc2, yc2, Rx2, Ry2)
-            r_bulk_raw = l1 if abs(l1 - start_val) <= abs(l2 - start_val) else l2
-            r_total_raw = r1 if abs(r1 - end_val) <= abs(r2 - end_val) else r2
+            r_bulk, r_total_raw = select_dual_intercepts(
+                ellipses[0], ellipses[1], x_left_min, x_right_min
+            )
         else:
-            xc1, yc1, Rx1, Ry1 = res_one
-            r_bulk_raw, r_total_raw = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            xc2 = yc2 = Rx2 = Ry2 = np.nan
-        r_bulk = r_bulk_raw if r_bulk_raw >= 0 else x_fit[0]
+            ellipses = [arc_to_ellipse(res_one)]
+            r_bulk, r_total_raw = solve_ellipse_xints(*ellipses[0])
         ri = r_total_raw - r_bulk
         fig_ind = plt.figure(figsize=(8, 4))
         plt.scatter(
             df_clean.iloc[:, 0], df_clean.iloc[:, 1], color="lightgray", alpha=0.3
         )
         plt.scatter(x_fit, y_fit, color="darkblue", s=10)
-        x_plot = np.linspace(r_bulk, r_total_raw, 500)
-        y_p = (
-            np.maximum(
-                semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1),
-                semi_ellipse(x_plot, xc2, yc2, Rx2, Ry2),
-            )
-            if use_dual
-            else semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1)
-        )
         lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
-        plt.plot(x_plot, y_p, "r-", label=lbl)
+        # In the two-ellipse model, draw each ellipse as a dashed gray
+        # line between its own intercepts.
+        if use_dual:
+            for ell in ellipses:
+                el, er = solve_ellipse_xints(*ell)
+                x_ell = np.linspace(el, er, 500)
+                y_ell = np.maximum(semi_ellipse(x_ell, *ell), 0)
+                plt.plot(x_ell, y_ell, "--", color="gray", linewidth=1)
+        # Draw the fit in red. In the two-ellipse model, the fit is the
+        # larger of the two ellipses at each point.
+        x_plot = np.linspace(r_bulk, r_total_raw, 500)
+        y_p = np.max([semi_ellipse(x_plot, *ell) for ell in ellipses], axis=0)
+        plt.plot(x_plot, np.maximum(y_p, 0), "r-", label=lbl)
         plt.title(
             cycle_title
             if cycle_title is not None
