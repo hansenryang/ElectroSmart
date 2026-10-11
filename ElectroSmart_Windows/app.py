@@ -873,7 +873,7 @@ def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
                         f"Run {b['run_no']}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
                     ):
                         st.write("**Files**")
-                        st.write(b["Bundled Files"])
+                        st.text(b["Bundled Files"])
                         st.write("**Voltage vs Time**")
                         st.image(b["img_cp"])
     st.success("All Runs are shown!!")
