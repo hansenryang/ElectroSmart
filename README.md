@@ -17,6 +17,7 @@ Properties: This app is run locally on your computer, or on the Streamlit websit
    - See `ECM Fit` in the Analysis Notes.
 2. Added a progress bar to the EIS fits. The bar shows the PEIS file (positive or negative, or the run) and the cycle that the app fits.
 3. A PEIS file must now also have the column `freq/Hz`.
+4. The EIS fit tables and CSV files show units in the column names, for example `R_bulk (Ohm)`. This applies to the semi-ellipse fit and to the ECM fit.
 
 ## Changes in v4.5
 
@@ -159,10 +160,10 @@ Each analysis makes a metadata `.txt` file. Keep this file with your results. It
 The file contains these parts:
 
 1. Header: the ElectroSmart version, the analysis name, the time of the analysis, the cell type, and the cell label.
-2. `Files Used in This Analysis`: the files that the analysis used.
-3. `Input Parameters`: the values that you entered for this analysis.
-4. `EIS Fitting`: the technique and its settings. For the semi-ellipse fit, the settings are the points to discard (left and right) and the fit choice. For the ECM fit, the settings are the circuit, the fit range, the weighting, the R1 start value, and the bulk arc limit. This part shows only if the analysis fits EIS data.
-5. `All Uploaded .mpr Files`: the name of each uploaded file, including the files that the analysis did not use.
+2. `All Uploaded .mpr Files`: the name of each uploaded file, including the files that the analysis did not use.
+3. `Files Used in This Analysis`: the files that the analysis used.
+4. `Input Parameters`: the values that you entered for this analysis.
+5. `EIS Fitting`: the technique and its settings. For the semi-ellipse fit, the settings are the points to discard (left and right) and the fit choice. For the ECM fit, the settings are the circuit, the `Diffusion tail` choice, the weighting, the R1 start value, and the bulk arc limit. This part shows only if the analysis fits EIS data.
 6. `Warnings Shown at Download`: each warning and error that the app shows when you download the file. If there are none, this part shows `None`.
 
 The file records only the inputs that the analysis needs. For Limiting Current, Potentiometric Data, the file shows the diffusion coefficient only if the app made a Sand's time fit.
@@ -245,7 +246,16 @@ The rule for R_bulk and R_i:
 - In a circuit with one arc, R3 is 0.
 - R_total = R1 + R2 + R3 in all cases. R_total does not include W.
 
-The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `C_eff,2 (F)` column and the legend of each cycle plot show the result of the rule.
+The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `C_eff,2 (F)` column of the ECM fit parameter table shows the value for the rule.
+
+The ECM fit gives two tables for each PEIS file (each run in Limiting Current):
+
+1. The summary table has the same columns as the semi-ellipse fit in v4.5, plus `Fit error (%)`. The columns are the cycle (or the run), `R_bulk (Ohm)`, `R_i (Ohm)`, and `R_total (Ohm)` (or `R_bulk + R_i (Ohm)`).
+2. The ECM fit parameter table has these columns: `Fit converged`, `Points fitted`, `Tail points removed`, `Fit error (%)`, `Fit note`, and, for each parameter, the value, the standard error, and the initial guess. It also has the standard errors of R_bulk and R_i, and C_eff of each arc.
+
+Each column name includes the unit in parentheses: Ohm for R, Ohm^-1 s^n for Q, (-) for n, Ohm s^-1/2 for A_W, and F for C_eff. The standard errors use the same formula as impedance.py. Each ZIP file and Current Fraction Excel file includes the parameter table.
+
+The legend of each cycle plot shows the circuit string (for example `R1-p(R2,Q2)-p(R3,Q3)-W`), then R_bulk and R_i, then each fitted parameter with its standard error and unit, and the fit error.
 
 The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of |Z - Z_fit| / |Z|. The `Fit note` column shows these conditions:
 

@@ -27,6 +27,20 @@ ECM_CIRCUITS: dict[str, tuple[int, bool]] = {
 }
 ECM_R1_START = 0.1
 
+# The units of the ECM parameters, for the tables and the plot legends.
+ECM_UNITS = {"R": "Ohm", "Q": "Ohm^-1 s^n", "n": "-", "A_W": "Ohm s^-1/2"}
+
+# The column names with units for the summary tables of both fits. The
+# analyses calculate with the names without units.
+SUMMARY_UNITS = {
+    "R_bulk": "R_bulk (Ohm)",
+    "R_i": "R_i (Ohm)",
+    "R_total": "R_total (Ohm)",
+    "R_bulk + R_i": "R_bulk + R_i (Ohm)",
+    "R_bulk_arc": "R_bulk_arc (Ohm)",
+    "R_i_arc": "R_i_arc (Ohm)",
+}
+
 # Global style updates
 plt.rcParams.update(
     {
@@ -528,6 +542,46 @@ def ecm_initial_guesses(
     return guesses
 
 
+def ecm_parameter_names(n_arcs: int, warburg: bool) -> list[tuple[str, str]]:
+    """List the names and units of the parameters of one ECM circuit.
+
+    Args:
+        n_arcs: The number of R|Q arcs, 1 or 2.
+        warburg: The circuit has a Warburg element.
+
+    Returns:
+        A list of (name, unit) pairs in the parameter order of
+        ecm_model.
+    """
+    names = [("R1", "R"), ("R2", "R"), ("Q2", "Q"), ("n2", "n")]
+    if n_arcs == 2:
+        names += [("R3", "R"), ("Q3", "Q"), ("n3", "n")]
+    if warburg:
+        names.append(("A_W", "A_W"))
+    return [(name, ECM_UNITS[kind]) for name, kind in names]
+
+
+def ecm_circuit_string(n_arcs: int, warburg: bool) -> str:
+    """Give the circuit string of one ECM circuit.
+
+    Use the syntax of impedance.py with the element names of the app.
+    For example, R1 + R2|Q2 + R3|Q3 + W gives "R1-p(R2,Q2)-p(R3,Q3)-W".
+
+    Args:
+        n_arcs: The number of R|Q arcs, 1 or 2.
+        warburg: The circuit has a Warburg element.
+
+    Returns:
+        The circuit string.
+    """
+    text = "R1-p(R2,Q2)"
+    if n_arcs == 2:
+        text += "-p(R3,Q3)"
+    if warburg:
+        text += "-W"
+    return text
+
+
 def ecm_model(
     params: np.ndarray, f: np.ndarray, n_arcs: int, warburg: bool
 ) -> np.ndarray:
@@ -586,7 +640,8 @@ def fit_ecm_spectrum(
         previous: The best parameters of the previous cycle.
 
     Returns:
-        A dictionary with the parameters, the standard errors, a
+        A dictionary with the parameters, the standard errors, the
+        initial guesses of the best start, the convergence flag, a
         function that calculates the fitted impedance at given
         frequencies, and the parameters in the fit order.
 
@@ -609,11 +664,13 @@ def fit_ecm_spectrum(
         return np.concatenate([d.real, d.imag])
 
     best = None
+    best_guess = None
     for guess in guesses:
+        guess = np.clip(guess, lower, upper)
         try:
             result = least_squares(
                 residuals,
-                np.clip(guess, lower, upper),
+                guess,
                 bounds=(lower, upper),
                 method="trf",
                 x_scale="jac",
@@ -623,19 +680,29 @@ def fit_ecm_spectrum(
             continue
         if best is None or result.cost < best.cost:
             best = result
+            best_guess = [float(v) for v in guess]
     if best is None:
         raise RuntimeError("No ECM fit converged.")
 
     fit_params = [float(v) for v in best.x]
-    # Standard errors as in curve_fit with relative sigma (impedance.py).
+    # Standard errors as in curve_fit with relative sigma (impedance.py):
+    # cov = (J^T J)^-1 * RSS / (N - p), from the SVD of J. Scale each column
+    # by its parameter value first, because Q (about 1e-10) and R (about
+    # 1e3) differ by many orders of magnitude.
     n_res = len(best.fun)
     dof = max(n_res - len(fit_params), 1)
+    scale = np.where(np.abs(best.x) > 0, np.abs(best.x), 1.0)
     try:
-        cov = np.linalg.pinv(best.jac.T @ best.jac) * (2 * best.cost / dof)
+        _, sing, vt = np.linalg.svd(best.jac * scale, full_matrices=False)
+        threshold = np.finfo(float).eps * max(best.jac.shape) * sing[0]
+        keep_sv = sing > threshold
+        cov_scaled = (vt[keep_sv].T / sing[keep_sv] ** 2) @ vt[keep_sv]
+        cov = cov_scaled * np.outer(scale, scale) * (2 * best.cost / dof)
         conf = [float(v) for v in np.sqrt(np.abs(np.diag(cov)))]
     except np.linalg.LinAlgError:
         conf = [np.nan] * len(fit_params)
     params = list(fit_params)
+    initial = list(best_guess)
 
     # Put the arc with the higher characteristic frequency first.
     if n_arcs == 2 and (
@@ -643,9 +710,12 @@ def fit_ecm_spectrum(
     ):
         params[1:4], params[4:7] = params[4:7], params[1:4]
         conf[1:4], conf[4:7] = conf[4:7], conf[1:4]
+        initial[1:4], initial[4:7] = initial[4:7], initial[1:4]
     return {
         "params": params,
         "conf": conf,
+        "initial": initial,
+        "success": bool(best.success),
         "predict": lambda freq: ecm_model(best.x, freq, n_arcs, warburg),
         "fit_params": fit_params,
     }
@@ -750,7 +820,13 @@ def ecm_fit(
     remove_tail: bool = True,
     cycle_title: Optional[str] = None,
     progress: Optional[Callable[[int, int, int], None]] = None,
-) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    io.BytesIO,
+    io.StringIO,
+    list[tuple[str, io.BytesIO]],
+]:
     """Fit each PEIS cycle in an MPR file with an equivalent circuit.
 
     Fit the chosen circuit to the whole spectrum. Drop the points with
@@ -777,17 +853,24 @@ def ecm_fit(
             number.
 
     Returns:
-        A tuple with the summary dataframe, the trend plot buffer, the
-        summary CSV buffer, and a list of (file name, image buffer)
-        pairs for each cycle.
+        A tuple with the summary dataframe (Cycle, R_bulk, R_i, R_total,
+        and Fit error (%)), the fit parameter dataframe, the trend plot
+        buffer, the summary CSV buffer, and a list of (file name, image
+        buffer) pairs for each cycle. The fit parameter dataframe has the
+        value, the standard error, and the initial guess of each
+        parameter, with units in the column names. The summary CSV has
+        units in the column names.
     """
     n_arcs, warburg = ECM_CIRCUITS[circuit_label]
-    n_params = (7 if n_arcs == 2 else 4) + (1 if warburg else 0)
+    names = ecm_parameter_names(n_arcs, warburg)
+    n_params = len(names)
+    circuit_text = ecm_circuit_string(n_arcs, warburg)
     data_filename.seek(0)
     mpr = BioLogic.MPRfile(data_filename)
     df_raw = pd.DataFrame(mpr.data)
     cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
-    results_list = []
+    summary_rows = []
+    param_rows = []
     cycle_images = []
     previous = None
     for i, c in enumerate(cycle_nums):
@@ -804,8 +887,10 @@ def ecm_fit(
         keep = positive & ~is_tail
         f = f_all[keep]
         Z = x_all[keep] - 1j * y_all[keep]
-        row = {
+        summary = {"Cycle": int(c)}
+        info = {
             "Cycle": int(c),
+            "Fit converged": False,
             "Points fitted": int(keep.sum()),
             "Tail points removed": int(is_tail.sum()),
         }
@@ -826,6 +911,7 @@ def ecm_fit(
         ax.scatter(Z.real, -Z.imag, color="darkblue", s=10)
 
         fit = None
+        resistance_entry = None
         # Each point gives two residuals (real and imaginary).
         enough_points = 2 * len(f) > n_params + 4
         if enough_points:
@@ -834,9 +920,12 @@ def ecm_fit(
             except RuntimeError:
                 fit = None
         if fit is None:
-            row.update({"R_bulk": np.nan, "R_i": np.nan, "R_total": np.nan})
-            row["Fit note"] = "too few points" if not enough_points else "fit failed"
-            ax.plot([], [], " ", label=row["Fit note"])
+            note = "too few points" if not enough_points else "fit failed"
+            summary.update(
+                {"R_bulk": np.nan, "R_i": np.nan, "R_total": np.nan, "Fit error (%)": np.nan}
+            )
+            info.update({"Fit error (%)": np.nan, "Fit note": note})
+            ax.plot([], [], " ", label=note)
         else:
             previous = fit["fit_params"]
             p = fit["params"]
@@ -853,7 +942,7 @@ def ecm_fit(
             c2 = ecm_effective_capacitance(r2, q2, n2)
             c3 = ecm_effective_capacitance(r3, q3, n3) if n_arcs == 2 else np.nan
             bulk_arc = bool(c2 < bulk_c_threshold)
-            # impedance.py gives one standard error for each parameter.
+            # The standard errors use the same formula as impedance.py.
             if bulk_arc:
                 r_bulk, r_i = r1 + r2, r3_sum
                 se_rb = np.sqrt(se[0] ** 2 + se[1] ** 2)
@@ -880,27 +969,32 @@ def ecm_fit(
             if r_i > 0 and (not np.isfinite(se_ri) or se_ri > 0.5 * r_i):
                 notes.append("R_i uncertain")
 
-            row.update(
+            summary.update(
                 {
                     "R_bulk": r_bulk,
                     "R_i": r_i,
                     "R_total": r_total,
-                    "R_bulk std. error": se_rb,
-                    "R_i std. error": se_ri,
-                    "C_eff,2 (F)": c2,
-                    "C_eff,3 (F)": c3,
-                    "R1": r1,
-                    "R2": r2,
-                    "Q2": q2,
-                    "n2": n2,
-                    "R3": r3,
-                    "Q3": q3,
-                    "n3": n3,
-                    "A_W (Ohm s^-1/2)": a_w,
+                    "Fit error (%)": fit_error,
+                }
+            )
+            info.update(
+                {
+                    "Fit converged": fit["success"],
                     "Fit error (%)": fit_error,
                     "Fit note": ", ".join(notes),
                 }
             )
+            for (name, unit), value, error, start in zip(
+                names, p, se, fit["initial"]
+            ):
+                info[f"{name} ({unit})"] = value
+                info[f"{name} std. error ({unit})"] = error
+                info[f"{name} initial guess ({unit})"] = start
+            info["R_bulk std. error (Ohm)"] = se_rb
+            info["R_i std. error (Ohm)"] = se_ri
+            info["C_eff,2 (F)"] = c2
+            if n_arcs == 2:
+                info["C_eff,3 (F)"] = c3
 
             f_line = np.logspace(np.log10(f.min()), np.log10(f.max()), 500)
             z_line = fit["predict"](f_line)
@@ -914,14 +1008,31 @@ def ecm_fit(
                 omega = 2 * np.pi * f_line
                 z_w = r_total + a_w * (1 - 1j) / np.sqrt(omega)
                 ax.plot(z_w.real, -z_w.imag, ":", color="gray", lw=1)
-            lbl = (
-                f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {r_i:.1f} Ω\n"
-                f"Bulk arc: {'R2|Q2' if bulk_arc else 'above range'}\n"
-                f"Fit error: {fit_error:.1f} %"
-            )
+
+            unit_text = {
+                "Ohm": "Ω",
+                "Ohm^-1 s^n": r"$\Omega^{-1}\,s^{n}$",
+                "-": "",
+                "Ohm s^-1/2": r"$\Omega\,s^{-1/2}$",
+            }
+            lines = [
+                f"{name} = {value:.3g} ± {error:.2g} {unit_text[unit]}".rstrip()
+                for (name, unit), value, error in zip(names, p, se)
+            ]
+            lines.append(f"Fit error: {fit_error:.1f} %")
             if notes:
-                lbl += "\nNote: " + ", ".join(notes)
-            ax.plot(z_line.real, -z_line.imag, "r-", label=lbl)
+                lines.append("Note: " + ", ".join(notes))
+            ax.plot(z_line.real, -z_line.imag, "r-", label="\n".join(lines))
+            # An entry without a marker for R_bulk and R_i.
+            (resistance_entry,) = ax.plot(
+                [],
+                [],
+                " ",
+                label=(
+                    f"$R_{{bulk}}$ = {r_bulk:.1f} ± {se_rb:.2g} Ω\n"
+                    f"$R_i$ = {r_i:.1f} ± {se_ri:.2g} Ω"
+                ),
+            )
 
         x_min, x_max = x_all.min(), x_all.max()
         y_max = max(y_all.max(), 0)
@@ -936,19 +1047,35 @@ def ecm_fit(
         ax.set_xlabel("Re(Z)/Ohm")
         ax.set_ylabel("-Im(Z)/Ohm")
         ax.set_aspect("equal")
+        # Show R_bulk and R_i first, directly below the circuit string.
+        handles, labels = ax.get_legend_handles_labels()
+        if resistance_entry is not None:
+            first = handles.index(resistance_entry)
+            handles.insert(0, handles.pop(first))
+            labels.insert(0, labels.pop(first))
         ax.legend(
-            loc="upper left", bbox_to_anchor=(1.05, 1), title=circuit_label
+            handles,
+            labels,
+            loc="upper left",
+            bbox_to_anchor=(1.05, 1),
+            title=f"ECM: {circuit_text}",
+            fontsize="small",
         )
         buf = io.BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
         cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
         plt.close(fig)
-        results_list.append(row)
+        summary_rows.append(summary)
+        param_rows.append(info)
 
-    summary_df = pd.DataFrame(results_list).sort_values(by="Cycle")
-    sum_buf, csv_buf = plot_resistance_trend(summary_df, cell_label, run_label)
-    return summary_df, sum_buf, csv_buf, cycle_images
+    summary_df = pd.DataFrame(summary_rows).sort_values(by="Cycle")
+    params_df = pd.DataFrame(param_rows).sort_values(by="Cycle")
+    sum_buf, _ = plot_resistance_trend(summary_df, cell_label, run_label)
+    csv_buf = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    return summary_df, params_df, sum_buf, csv_buf, cycle_images
 
 
 def plot_cp_ewe(
@@ -994,7 +1121,13 @@ def impedance_fit(
     run_label: str,
     cycle_title: Optional[str] = None,
     progress: Optional[Callable[[int, int, int], None]] = None,
-) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
+) -> tuple[
+    pd.DataFrame,
+    Optional[pd.DataFrame],
+    io.BytesIO,
+    io.StringIO,
+    list[tuple[str, io.BytesIO]],
+]:
     """Fit each PEIS cycle with the technique in the settings.
 
     Call ecm_fit for "ECM fit". Call semiellipse_fit for the other
@@ -1014,9 +1147,11 @@ def impedance_fit(
             ecm_fit.
 
     Returns:
-        A tuple with the summary dataframe, the trend plot buffer, the
+        A tuple with the summary dataframe, the fit parameter dataframe
+        (None for the semi-ellipse fit), the trend plot buffer, the
         summary CSV buffer, and a list of (file name, image buffer)
-        pairs for each cycle.
+        pairs for each cycle. See ecm_fit. The summary CSV has units in
+        the column names.
     """
     if settings["technique"] == "ECM fit":
         return ecm_fit(
@@ -1030,7 +1165,7 @@ def impedance_fit(
             cycle_title=cycle_title,
             progress=progress,
         )
-    return semiellipse_fit(
+    summary_df, sum_buf, csv_buf, cycle_imgs = semiellipse_fit(
         cell_type,
         cell_label,
         settings["discard_left"],
@@ -1042,6 +1177,11 @@ def impedance_fit(
         cycle_title=cycle_title,
         progress=progress,
     )
+    # Write the summary CSV with units in the column names.
+    csv_buf = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    return summary_df, None, sum_buf, csv_buf, cycle_imgs
 
 
 def plot_limiting_peis_fit(
@@ -1050,7 +1190,7 @@ def plot_limiting_peis_fit(
     run_label: str,
     settings: dict[str, Any],
     density: Optional[float] = None,
-) -> tuple[Optional[io.BytesIO], pd.DataFrame, io.StringIO]:
+) -> tuple[Optional[io.BytesIO], pd.DataFrame, Optional[pd.DataFrame], io.StringIO]:
     """Fit the PEIS data for one Limiting Current run.
 
     Call impedance_fit and return the first cycle image.
@@ -1065,9 +1205,10 @@ def plot_limiting_peis_fit(
 
     Returns:
         The first cycle image buffer, or None if no cycle exists. Also
-        return the summary dataframe and the summary CSV buffer.
+        return the summary dataframe, the fit parameter dataframe (None
+        for the semi-ellipse fit), and the summary CSV buffer.
     """
-    summary_df, sum_buf, csv_buf, cycle_imgs = impedance_fit(
+    summary_df, params_df, sum_buf, csv_buf, cycle_imgs = impedance_fit(
         settings,
         "Limiting",
         cell_label,
@@ -1080,8 +1221,8 @@ def plot_limiting_peis_fit(
         ),
     )
     if cycle_imgs:
-        return cycle_imgs[0][1], summary_df, csv_buf
-    return None, summary_df, csv_buf
+        return cycle_imgs[0][1], summary_df, params_df, csv_buf
+    return None, summary_df, params_df, csv_buf
 
 
 def is_diverging(
