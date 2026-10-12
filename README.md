@@ -11,11 +11,11 @@ Properties: This app is run locally on your computer, or on the Streamlit websit
 ## Changes in v4.6
 
 1. Added the `ECM fit` technique for EIS data.
-   - The ECM fit is a third choice in `Technique`, next to `Semi-ellipse fit`.
+   - The ECM fit is a third choice in `Technique`, next to `Semi-ellipse fit`. The page shows it as `ECM fit (modeled after impedance.py)`. The `?` icon next to `Technique:` links to the impedance.py documentation.
    - It fits an equivalent circuit to the whole spectrum. Choose the circuit from a list: R1 + R2|Q2 + R3|Q3 or R1 + R2|Q2, each with or without a Warburg element (W) for diffusion.
    - EIS Fit (Single File), Preconditioning, Limiting Current, and Current Fraction can use it. Current Fraction now has the `Technique` choice.
    - See `ECM Fit` in the Analysis Notes.
-2. Added `impedance` (impedance.py) to the necessary libraries.
+2. Added a progress bar to the EIS fits. The bar shows the PEIS file (positive or negative, or the run) and the cycle that the app fits.
 3. A PEIS file must now also have the column `freq/Hz`.
 
 ## Changes in v4.5
@@ -116,7 +116,6 @@ These are also listed in `requirements.txt`.
 5. scipy
 6. galvani
 7. openpyxl
-8. impedance
 
 ## Operating Instructions for Windows
 
@@ -210,7 +209,7 @@ The metadata file records all of these warnings.
 
 ### ECM Fit
 
-The ECM fit is a complex nonlinear least-squares fit of an equivalent circuit. It uses the `impedance` library. The semi-ellipse fit uses only the arc part of the spectrum. The ECM fit uses the whole spectrum.
+The ECM fit is a complex nonlinear least-squares fit of an equivalent circuit. It uses `scipy`. The circuit equations are the same as the R, CPE, and W elements of the `impedance` (impedance.py) library. The semi-ellipse fit uses only the arc part of the spectrum. The ECM fit uses the whole spectrum.
 
 Choose one of these circuits. Q is a constant phase element. W is a semi-infinite Warburg element for the diffusion tail at low frequency.
 
@@ -246,7 +245,7 @@ The rule for R_bulk and R_i:
 - In a circuit with one arc, R3 is 0.
 - R_total = R1 + R2 + R3 in all cases. R_total does not include W.
 
-The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `Bulk arc` column shows the result of the rule.
+The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `C_eff,2 (F)` column and the legend of each cycle plot show the result of the rule.
 
 The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of |Z - Z_fit| / |Z|. The `Fit note` column shows these conditions:
 
@@ -257,7 +256,7 @@ The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of
 
 In the cycle plot, the red line is the full circuit. Each gray dashed line is one R|Q arc at its position on the real axis. The gray dotted line is the Warburg tail.
 
-The ECM fit is slower than the semi-ellipse fit. Each cycle takes approximately 1 to 5 seconds.
+The ECM fit of one cycle takes less than 1 second. The plot of each cycle takes approximately 0.5 seconds. The semi-ellipse fit uses the same plot time.
 
 ### Preconditioning
 

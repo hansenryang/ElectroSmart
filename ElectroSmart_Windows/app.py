@@ -8,7 +8,7 @@ from galvani import BioLogic
 from PIL import Image
 import base64
 from datetime import datetime, timedelta, timezone
-from typing import Any, IO, Optional
+from typing import Any, Callable, IO, Optional
 
 from plotting import (
     plot_all_EIS_precond,
@@ -88,14 +88,24 @@ def impedance_technique_radio(key: str) -> str:
         key: A unique Streamlit widget key.
 
     Returns:
-        The chosen technique label.
+        The chosen technique label. The page shows the label "ECM fit
+        (modeled after impedance.py)". The return value is "ECM fit".
     """
     return st.radio(
         "Technique:",
         ["Linear fit", "Semi-ellipse fit", "ECM fit"],
+        format_func=lambda t: (
+            "ECM fit (modeled after impedance.py)" if t == "ECM fit" else t
+        ),
         horizontal=True,
         index=1,
         key=key,
+        help=(
+            "ECM fit: an equivalent circuit fit to the whole spectrum. The fit "
+            "is modeled after "
+            "[impedance.py](https://impedancepy.readthedocs.io/en/latest/). "
+            "It uses the same element equations, but a faster calculation."
+        ),
     )
 
 
@@ -161,7 +171,7 @@ def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
                 "W is a Warburg element for the diffusion tail."
             ),
         )
-        if ECM_CIRCUITS[settings["ecm_circuit"]][2]:
+        if ECM_CIRCUITS[settings["ecm_circuit"]][1]:
             st.caption("The fit uses the whole spectrum.")
         else:
             tail_choice = st.radio(
@@ -185,6 +195,27 @@ def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
         settings["discard_right"] = right
         settings["fit_choice"] = single_or_dual_ellipse(f"{key_prefix}_fit_choice")
     return settings
+
+
+def fit_progress_bar(label: str) -> tuple[Callable[[int, int, int], None], Any]:
+    """Show a progress bar for the impedance fit of one PEIS file.
+
+    Args:
+        label: The text before the cycle number, for example
+            "Positive PEIS (file.mpr)".
+
+    Returns:
+        A function for the progress argument of impedance_fit, and the
+        progress bar. Call empty() on the bar after the fit.
+    """
+    bar = st.progress(0.0, text=f"{label}: reading the file")
+
+    def update(done: int, total: int, cycle: int) -> None:
+        bar.progress(
+            done / total, text=f"{label}: fitting cycle {cycle} ({done + 1} of {total})"
+        )
+
+    return update, bar
 
 
 def record_message(kind: str, message: str) -> None:
@@ -458,9 +489,11 @@ def fit_current_fraction_eis_resistances(
         ("R_pos", "Positive", pos_eis_file),
         ("R_neg", "Negative", neg_eis_file),
     ]:
+        update, bar = fit_progress_bar(f"{run_label} PEIS ({f_obj.name})")
         fit_df, trend_buf, _, _ = impedance_fit(
-            settings, "Current Fraction", cell_label, f_obj, run_label
+            settings, "Current Fraction", cell_label, f_obj, run_label, progress=update
         )
+        bar.empty()
         fit_df = fit_df.sort_values("Cycle").reset_index(drop=True)
         first_cycle = fit_df.iloc[0]
         last_cycle = fit_df.iloc[-1]
@@ -571,7 +604,7 @@ def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
             (
                 "Fit range",
                 "Whole spectrum, points with -Im(Z) <= 0 dropped"
-                if ECM_CIRCUITS[settings["ecm_circuit"]][2]
+                if ECM_CIRCUITS[settings["ecm_circuit"]][1]
                 or not settings["ecm_remove_tail"]
                 else "Whole spectrum, points with -Im(Z) <= 0 and the "
                 "low-frequency diffusion tail dropped",
@@ -741,9 +774,11 @@ def run_eis_analysis(
         st.session_state[f"data_{key}"] = img_buf
         st.session_state[f"fname_{key}"] = f"{cell_label}_{key}_Plot.png"
 
+        update, bar = fit_progress_bar(f"{key} PEIS ({fname})")
         df, sum_fig, csv_data, cyc_imgs = impedance_fit(
-            settings, cell_type, cell_label, f_obj, key
+            settings, cell_type, cell_label, f_obj, key, progress=update
         )
+        bar.empty()
         st.session_state[f"fit_df_{key}"] = df
         st.session_state[f"fit_fig_{key}"] = sum_fig
         st.session_state[f"fit_csv_{key}"] = csv_data
@@ -1562,7 +1597,16 @@ if cell_type and cell_label and uploaded_files:
                     peis_results = []
                     all_peis_raw_data = []
 
-                    for b in imp_bundles:
+                    run_bar = st.progress(0.0)
+                    for run_index, b in enumerate(imp_bundles):
+                        run_bar.progress(
+                            run_index / len(imp_bundles),
+                            text=(
+                                f"Fitting Run {b['run_no']} "
+                                f"({run_index + 1} of {len(imp_bundles)}): "
+                                f"{b['f_peis'].name}"
+                            ),
+                        )
                         b["f_peis"].seek(0)
                         mpr_peis = BioLogic.MPRfile(b["f_peis"])
                         df_peis_raw = pd.DataFrame(mpr_peis.data)
@@ -1583,7 +1627,7 @@ if cell_type and cell_label and uploaded_files:
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
                         # The ellipse fit gives the arc columns. The ECM fit
-                        # gives the bulk arc and fit quality columns.
+                        # gives the fit quality columns.
                         lc_columns = [
                             "Run_no",
                             "Current (mA/cm^2)",
@@ -1592,13 +1636,13 @@ if cell_type and cell_label and uploaded_files:
                             "R_bulk + R_i",
                             "R_bulk_arc",
                             "R_i_arc",
-                            "Bulk arc",
                             "Fit error (%)",
                             "Fit note",
                         ]
                         fit_df = fit_df[[c for c in lc_columns if c in fit_df.columns]]
                         peis_results.append(fit_df)
 
+                    run_bar.empty()
                     peis_raw_combined = pd.concat(all_peis_raw_data)
                     st.session_state["lim_bundles_peis"] = imp_bundles
                     st.session_state["peis_summary_all"] = pd.concat(
