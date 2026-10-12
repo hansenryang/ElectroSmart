@@ -12,7 +12,7 @@ Properties: This app is run locally on your computer, or on the Streamlit websit
 
 1. Added the `ECM fit` technique for EIS data.
    - The ECM fit is a third choice in `Technique`, next to `Semi-ellipse fit`.
-   - It fits the equivalent circuit R1 + R2|Q2 + R3|Q3 to the whole spectrum. It adds Q4 for the diffusion tail if the data needs it.
+   - It fits an equivalent circuit to the whole spectrum. Choose the circuit from a list: R1 + R2|Q2 + R3|Q3 or R1 + R2|Q2, each with or without a Warburg element (W) for diffusion.
    - EIS Fit (Single File), Preconditioning, Limiting Current, and Current Fraction can use it. Current Fraction now has the `Technique` choice.
    - See `ECM Fit` in the Analysis Notes.
 2. Added `impedance` (impedance.py) to the necessary libraries.
@@ -212,21 +212,39 @@ The metadata file records all of these warnings.
 
 The ECM fit is a complex nonlinear least-squares fit of an equivalent circuit. It uses the `impedance` library. The semi-ellipse fit uses only the arc part of the spectrum. The ECM fit uses the whole spectrum.
 
+Choose one of these circuits. Q is a constant phase element. W is a semi-infinite Warburg element for the diffusion tail at low frequency.
+
+- R1 + R2|Q2 + R3|Q3 (default)
+- R1 + R2|Q2 + R3|Q3 + W
+- R1 + R2|Q2
+- R1 + R2|Q2 + W
+
 The app does these steps for each cycle:
 
 1. Remove the points where `-Im(Z)` is 0 or less.
-2. Fit R1 + R2|Q2 + R3|Q3. Q is a constant phase element. R1 is free, with a start value of 0.1 Ohm.
-3. Fit R1 + R2|Q2 + R3|Q3 + Q4. Q4 is the diffusion tail at low frequency.
-4. Use the circuit with the lower BIC. The `Q4 used` column shows the choice.
-5. Put the arc with the higher characteristic frequency in R2|Q2.
-6. Calculate the effective capacitance of R2|Q2: C_eff = (R2 Q2)^(1/n2) / R2.
-7. Find R_bulk and R_i with the rule below.
+2. If the circuit has no W and `Diffusion tail` is `Remove tail before fitting`, remove the diffusion tail. See the rule below.
+3. Fit the circuit. R1 is free, with a start value of 0.1 Ohm.
+4. In a circuit with two arcs, put the arc with the higher characteristic frequency in R2|Q2.
+5. Calculate the effective capacitance of R2|Q2: C_eff = (R2 Q2)^(1/n2) / R2.
+6. Find R_bulk and R_i with the rule below.
+
+The rule for the diffusion tail:
+
+1. Start at the lowest frequency.
+2. Move to higher frequencies while `-Im(Z)` decreases.
+3. The point where `-Im(Z)` stops decreasing is the valley between the last arc and the tail.
+4. Do not fit the points at lower frequencies than the valley. The plot shows these points as open gray circles.
+
+The app does not remove a tail of fewer than 3 points, or a tail that rises less than 5% of the highest `-Im(Z)`. The app always keeps the first third of the spectrum. The `Points fitted` and `Tail points removed` columns show the result.
+
+Select `Fit all points` if the spectrum has no clear valley. An example is a quarter circle that rises up to the lowest frequency. If you fit a tail without W, the last arc includes the tail, and R_i is too high.
 
 The rule for R_bulk and R_i:
 
 - If C_eff of R2|Q2 is below the limit (default 1 nF), R2|Q2 is the bulk arc. Then R_bulk = R1 + R2, and R_i = R3.
 - If not, the bulk arc is above the measured frequencies. Then R_bulk = R1, and R_i = R2 + R3.
-- R_total = R1 + R2 + R3 in both cases. R_total does not include Q4.
+- In a circuit with one arc, R3 is 0.
+- R_total = R1 + R2 + R3 in all cases. R_total does not include W.
 
 The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `Bulk arc` column shows the result of the rule.
 
@@ -235,8 +253,11 @@ The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of
 - `arcs overlap`: the characteristic frequencies of the two arcs are less than 10 times apart. The split between R_bulk and R_i is uncertain.
 - `arc collapsed`: one arc has R near 0, or n at the lower limit.
 - `R_i uncertain`: the standard error of R_i is more than 50% of R_i.
+- `no interface arc`: the circuit has one arc, and that arc is the bulk arc. Then R_i is 0. Use a circuit with two arcs.
 
-The ECM fit is slower than the semi-ellipse fit. Each cycle takes approximately 2 to 10 seconds.
+In the cycle plot, the red line is the full circuit. Each gray dashed line is one R|Q arc at its position on the real axis. The gray dotted line is the Warburg tail.
+
+The ECM fit is slower than the semi-ellipse fit. Each cycle takes approximately 1 to 5 seconds.
 
 ### Preconditioning
 

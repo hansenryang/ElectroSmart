@@ -13,6 +13,7 @@ from typing import Any, IO, Optional
 from plotting import (
     plot_all_EIS_precond,
     impedance_fit,
+    ECM_CIRCUITS,
     ECM_R1_START,
     get_current_from_mpr,
     plot_cp_ewe,
@@ -136,21 +137,47 @@ def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
 
     Returns:
         The fit settings. The keys are "technique", "discard_left",
-        "discard_right", "fit_choice", and "bulk_c_threshold". A key that
-        the technique does not use has the value None.
+        "discard_right", "fit_choice", "ecm_circuit", "ecm_remove_tail",
+        and "bulk_c_threshold". A key that the technique does not use has
+        the value None.
     """
     settings = {
         "technique": technique,
         "discard_left": None,
         "discard_right": None,
         "fit_choice": None,
+        "ecm_circuit": None,
+        "ecm_remove_tail": None,
         "bulk_c_threshold": None,
     }
     if technique == "ECM fit":
-        st.caption(
-            "The fit uses R1 + R2|Q2 + R3|Q3 on the whole spectrum. "
-            "The fit adds Q4 for the diffusion tail if the BIC is lower."
+        settings["ecm_circuit"] = st.selectbox(
+            "Circuit:",
+            list(ECM_CIRCUITS),
+            index=0,
+            key=f"{key_prefix}_ecm_circuit",
+            help=(
+                "Q is a constant phase element. "
+                "W is a Warburg element for the diffusion tail."
+            ),
         )
+        if ECM_CIRCUITS[settings["ecm_circuit"]][2]:
+            st.caption("The fit uses the whole spectrum.")
+        else:
+            tail_choice = st.radio(
+                "Diffusion tail:",
+                ["Remove tail before fitting", "Fit all points"],
+                horizontal=True,
+                index=0,
+                key=f"{key_prefix}_ecm_tail",
+                help=(
+                    "Remove: the app finds the valley between the last arc and "
+                    "the low-frequency rise, and does not fit the points after it. "
+                    "Use 'Fit all points' if the spectrum has no clear valley, for "
+                    "example a quarter circle that rises to the lowest frequency."
+                ),
+            )
+            settings["ecm_remove_tail"] = tail_choice == "Remove tail before fitting"
         settings["bulk_c_threshold"] = get_ecm_parameters(f"{key_prefix}_bulk_c")
     else:
         left, right = get_discard_parameters()
@@ -540,8 +567,15 @@ def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
     if settings["technique"] == "ECM fit":
         return [
             ("Technique", settings["technique"]),
-            ("Circuit", "R1 + R2|Q2 + R3|Q3, plus Q4 if the BIC is lower"),
-            ("Fit range", "Whole spectrum, points with -Im(Z) <= 0 dropped"),
+            ("Circuit", settings["ecm_circuit"]),
+            (
+                "Fit range",
+                "Whole spectrum, points with -Im(Z) <= 0 dropped"
+                if ECM_CIRCUITS[settings["ecm_circuit"]][2]
+                or not settings["ecm_remove_tail"]
+                else "Whole spectrum, points with -Im(Z) <= 0 and the "
+                "low-frequency diffusion tail dropped",
+            ),
             ("Weighting", "|Z| (modulus)"),
             ("R1 start value (Ohm)", ECM_R1_START),
             (
@@ -1549,7 +1583,7 @@ if cell_type and cell_label and uploaded_files:
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
                         # The ellipse fit gives the arc columns. The ECM fit
-                        # gives the bulk arc, Q4, and fit quality columns.
+                        # gives the bulk arc and fit quality columns.
                         lc_columns = [
                             "Run_no",
                             "Current (mA/cm^2)",
@@ -1559,7 +1593,6 @@ if cell_type and cell_label and uploaded_files:
                             "R_bulk_arc",
                             "R_i_arc",
                             "Bulk arc",
-                            "Q4 used",
                             "Fit error (%)",
                             "Fit note",
                         ]
