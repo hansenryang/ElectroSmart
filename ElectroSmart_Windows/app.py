@@ -12,7 +12,8 @@ from typing import Any, IO, Optional
 
 from plotting import (
     plot_all_EIS_precond,
-    semiellipse_fit,
+    impedance_fit,
+    ECM_R1_START,
     get_current_from_mpr,
     plot_cp_ewe,
     analyze_sand_and_polarization,
@@ -35,7 +36,7 @@ from validation import (
     inspect_mpr_file,
 )
 
-version = 4.5
+version = 4.6
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
@@ -90,11 +91,73 @@ def impedance_technique_radio(key: str) -> str:
     """
     return st.radio(
         "Technique:",
-        ["Linear fit", "Semi-ellipse fit"],
+        ["Linear fit", "Semi-ellipse fit", "ECM fit"],
         horizontal=True,
         index=1,
         key=key,
     )
+
+
+def get_ecm_parameters(key: str) -> float:
+    """Show a number input for the bulk arc capacitance limit.
+
+    Args:
+        key: A unique Streamlit widget key.
+
+    Returns:
+        The capacitance limit, in F.
+    """
+    limit_nf = st.number_input(
+        "Bulk arc if C_eff of R2|Q2 is below (nF):",
+        min_value=0.0,
+        value=1.0,
+        step=0.1,
+        format="%.2f",
+        key=key,
+        help=(
+            "If C_eff of R2|Q2 is below this limit, R2|Q2 is the bulk arc. "
+            "Then R_bulk = R1 + R2 and R_i = R3. "
+            "If not, R_bulk = R1 and R_i = R2 + R3."
+        ),
+    )
+    return limit_nf * 1e-9
+
+
+def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
+    """Show the widgets for the chosen impedance fit technique.
+
+    Show the discard inputs and the ellipse fit choice for the
+    semi-ellipse fit. Show the bulk arc capacitance limit for the ECM
+    fit.
+
+    Args:
+        technique: The chosen impedance fit technique.
+        key_prefix: The prefix for the unique Streamlit widget keys.
+
+    Returns:
+        The fit settings. The keys are "technique", "discard_left",
+        "discard_right", "fit_choice", and "bulk_c_threshold". A key that
+        the technique does not use has the value None.
+    """
+    settings = {
+        "technique": technique,
+        "discard_left": None,
+        "discard_right": None,
+        "fit_choice": None,
+        "bulk_c_threshold": None,
+    }
+    if technique == "ECM fit":
+        st.caption(
+            "The fit uses R1 + R2|Q2 + R3|Q3 on the whole spectrum. "
+            "The fit adds Q4 for the diffusion tail if the BIC is lower."
+        )
+        settings["bulk_c_threshold"] = get_ecm_parameters(f"{key_prefix}_bulk_c")
+    else:
+        left, right = get_discard_parameters()
+        settings["discard_left"] = left
+        settings["discard_right"] = right
+        settings["fit_choice"] = single_or_dual_ellipse(f"{key_prefix}_fit_choice")
+    return settings
 
 
 def record_message(kind: str, message: str) -> None:
@@ -343,13 +406,11 @@ def fit_current_fraction_eis_resistances(
     cell_label: str,
     pos_eis_file: IO[bytes],
     neg_eis_file: IO[bytes],
-    discard_left: int,
-    discard_right: int,
-    fit_choice: str,
+    settings: dict[str, Any],
 ) -> tuple[dict[str, list[float]], pd.DataFrame]:
     """Fit R_bulk and R_i from the positive and negative PEIS files.
 
-    Fit each PEIS file with the semi-ellipse method. Use the first
+    Fit each PEIS file with the technique in the settings. Use the first
     cycle as the initial resistance and the last cycle as the
     steady-state resistance.
 
@@ -357,9 +418,7 @@ def fit_current_fraction_eis_resistances(
         cell_label: The label of the cell under test.
         pos_eis_file: The positive polarity PEIS file object.
         neg_eis_file: The negative polarity PEIS file object.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-        fit_choice: The chosen ellipse fit mode.
+        settings: The fit settings. See get_fit_settings.
 
     Returns:
         A dictionary of fitted resistances, and a combined fit table
@@ -372,15 +431,8 @@ def fit_current_fraction_eis_resistances(
         ("R_pos", "Positive", pos_eis_file),
         ("R_neg", "Negative", neg_eis_file),
     ]:
-        fit_df, trend_buf, _, _ = semiellipse_fit(
-            "Current Fraction",
-            cell_label,
-            discard_left,
-            discard_right,
-            f_obj,
-            run_label,
-            fit_choice == "Two Ellipse (Recommended)",
-            fit_choice == "Single Ellipse",
+        fit_df, trend_buf, _, _ = impedance_fit(
+            settings, "Current Fraction", cell_label, f_obj, run_label
         )
         fit_df = fit_df.sort_values("Cycle").reset_index(drop=True)
         first_cycle = fit_df.iloc[0]
@@ -474,27 +526,34 @@ def build_metadata_text(
     return "\r\n".join(lines) + "\r\n"
 
 
-def eis_fit_metadata(
-    technique: str, fit_choice: str, discard_left: int, discard_right: int
-) -> list[tuple[str, Any]]:
+def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
     """List the EIS fit settings for a metadata file.
 
-    Give the value of each EIS fit widget. Do not add other text.
+    Give only the values that the chosen technique uses.
 
     Args:
-        technique: The chosen impedance fit technique.
-        fit_choice: The chosen ellipse fit mode.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
+        settings: The fit settings. See get_fit_settings.
 
     Returns:
         A list of (name, value) pairs.
     """
+    if settings["technique"] == "ECM fit":
+        return [
+            ("Technique", settings["technique"]),
+            ("Circuit", "R1 + R2|Q2 + R3|Q3, plus Q4 if the BIC is lower"),
+            ("Fit range", "Whole spectrum, points with -Im(Z) <= 0 dropped"),
+            ("Weighting", "|Z| (modulus)"),
+            ("R1 start value (Ohm)", ECM_R1_START),
+            (
+                "Bulk arc if C_eff of R2|Q2 is below (nF)",
+                round(settings["bulk_c_threshold"] * 1e9, 6),
+            ),
+        ]
     return [
-        ("Technique", technique),
-        ("Points to discard (left)", int(discard_left)),
-        ("Points to discard (right)", int(discard_right)),
-        ("Fit Choice", fit_choice),
+        ("Technique", settings["technique"]),
+        ("Points to discard (left)", int(settings["discard_left"])),
+        ("Points to discard (right)", int(settings["discard_right"])),
+        ("Fit Choice", settings["fit_choice"]),
     ]
 
 
@@ -621,11 +680,9 @@ def run_eis_analysis(
     cell_label: str,
     mpr_files: list[IO[bytes]],
     selections: dict[str, str],
-    discard_left: int,
-    discard_right: int,
-    fit_choice: str,
+    settings: dict[str, Any],
 ) -> None:
-    """Run the EIS overview plot and the semi-ellipse fit for each
+    """Run the EIS overview plot and the impedance fit for each
     selected file.
 
     Store each result in session state under the matching key in
@@ -638,9 +695,7 @@ def run_eis_analysis(
         mpr_files: A list of all uploaded MPR file objects.
         selections: A dictionary that maps each result key to a file
             name.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-        fit_choice: The chosen ellipse fit mode.
+        settings: The fit settings. See get_fit_settings.
 
     Returns:
         None. Store all results in session state.
@@ -652,15 +707,8 @@ def run_eis_analysis(
         st.session_state[f"data_{key}"] = img_buf
         st.session_state[f"fname_{key}"] = f"{cell_label}_{key}_Plot.png"
 
-        df, sum_fig, csv_data, cyc_imgs = semiellipse_fit(
-            cell_type,
-            cell_label,
-            discard_left,
-            discard_right,
-            f_obj,
-            key,
-            fit_choice == "Two Ellipse (Recommended)",
-            fit_choice == "Single Ellipse",
+        df, sum_fig, csv_data, cyc_imgs = impedance_fit(
+            settings, cell_type, cell_label, f_obj, key
         )
         st.session_state[f"fit_df_{key}"] = df
         st.session_state[f"fit_fig_{key}"] = sum_fig
@@ -1112,9 +1160,8 @@ if cell_type and cell_label and uploaded_files:
         if tech == "Linear fit":
             show_warning("This technique is not yet supported.")
 
-        if tech == "Semi-ellipse fit":
-            discard_left, discard_right = get_discard_parameters()
-            fit_choice = single_or_dual_ellipse("single_fit_choice")
+        if tech in ("Semi-ellipse fit", "ECM fit"):
+            fit_settings = get_fit_settings(tech, "single")
 
             if st.button("Generate EIS Plots", key="single_generate_button"):
                 with st.spinner(
@@ -1125,9 +1172,7 @@ if cell_type and cell_label and uploaded_files:
                         cell_label,
                         mpr_files,
                         selections,
-                        discard_left,
-                        discard_right,
-                        fit_choice,
+                        fit_settings,
                     )
                     st.session_state["fit_meta_single"] = build_metadata_text(
                         "EIS Fit (Single File)",
@@ -1137,9 +1182,7 @@ if cell_type and cell_label and uploaded_files:
                             ("Files Used in This Analysis", [("PEIS File", single_peis_name)]),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    tech, fit_choice, discard_left, discard_right
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )
@@ -1199,9 +1242,8 @@ if cell_type and cell_label and uploaded_files:
             if tech == "Linear fit":
                 show_warning("This technique is not yet supported.")
 
-            if tech == "Semi-ellipse fit":
-                discard_left, discard_right = get_discard_parameters()
-                fit_choice = single_or_dual_ellipse("preconditioning_fit_choice")
+            if tech in ("Semi-ellipse fit", "ECM fit"):
+                fit_settings = get_fit_settings(tech, "preconditioning")
 
                 generate_col, metadata_col, _ = st.columns([1, 1, 3])
                 if generate_col.button(
@@ -1215,9 +1257,7 @@ if cell_type and cell_label and uploaded_files:
                             cell_label,
                             mpr_files,
                             selections,
-                            discard_left,
-                            discard_right,
-                            fit_choice,
+                            fit_settings,
                         )
                         st.session_state["fit_meta_precond"] = build_metadata_text(
                             "Preconditioning",
@@ -1233,9 +1273,7 @@ if cell_type and cell_label and uploaded_files:
                                 ),
                                 (
                                     "EIS Fitting",
-                                    eis_fit_metadata(
-                                        tech, fit_choice, discard_left, discard_right
-                                    ),
+                                    eis_fit_metadata(fit_settings),
                                 ),
                             ],
                         )
@@ -1481,10 +1519,9 @@ if cell_type and cell_label and uploaded_files:
         if tech == "Linear fit":
             show_warning("This technique is not yet supported.")
 
-        if tech == "Semi-ellipse fit":
+        if tech in ("Semi-ellipse fit", "ECM fit"):
 
-            discard_left, discard_right = get_discard_parameters()
-            fit_choice = single_or_dual_ellipse("limiting_current_fit_choice")
+            fit_settings = get_fit_settings(tech, "limiting_current")
 
             if st.button("Process Impedance Data", disabled=not imp_bundles):
                 with st.spinner("Analyzing Impedance Data ..."):
@@ -1502,10 +1539,7 @@ if cell_type and cell_label and uploaded_files:
                             b["f_peis"],
                             cell_label,
                             f"Run {b['run_no']}",
-                            discard_left,
-                            discard_right,
-                            fit_choice == "Two Ellipse (Recommended)",
-                            fit_choice == "Single Ellipse",
+                            fit_settings,
                             b["Current Density (mA/cm²)"],
                         )
                         b["fig_peis"] = fit_img_buf
@@ -1514,17 +1548,22 @@ if cell_type and cell_label and uploaded_files:
                         fit_df["Run_no"] = b["run_no"]
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
-                        fit_df = fit_df[
-                            [
-                                "Run_no",
-                                "Current (mA/cm^2)",
-                                "R_bulk",
-                                "R_i",
-                                "R_bulk + R_i",
-                                "R_bulk_arc",
-                                "R_i_arc",
-                            ]
+                        # The ellipse fit gives the arc columns. The ECM fit
+                        # gives the bulk arc, Q4, and fit quality columns.
+                        lc_columns = [
+                            "Run_no",
+                            "Current (mA/cm^2)",
+                            "R_bulk",
+                            "R_i",
+                            "R_bulk + R_i",
+                            "R_bulk_arc",
+                            "R_i_arc",
+                            "Bulk arc",
+                            "Q4 used",
+                            "Fit error (%)",
+                            "Fit note",
                         ]
+                        fit_df = fit_df[[c for c in lc_columns if c in fit_df.columns]]
                         peis_results.append(fit_df)
 
                     peis_raw_combined = pd.concat(all_peis_raw_data)
@@ -1593,9 +1632,7 @@ if cell_type and cell_label and uploaded_files:
                             ),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    tech, fit_choice, discard_left, discard_right
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )
@@ -1746,8 +1783,11 @@ if cell_type and cell_label and uploaded_files:
                 "Please select a distinct file for each polarity."
             )
 
-        discard_left, discard_right = get_discard_parameters()
-        fit_choice = single_or_dual_ellipse("current_fraction_fit_choice")
+        cf_tech = impedance_technique_radio("current_fraction_impedance_technique")
+        if cf_tech == "Linear fit":
+            show_warning("This technique is not yet supported.")
+            st.stop()
+        fit_settings = get_fit_settings(cf_tech, "current_fraction")
 
         st.write("#### Uploaded CA/OCV MPR Files")
         st.dataframe(pd.DataFrame({"File": [f.name for f in cf_run_files]}), width="stretch")
@@ -1761,9 +1801,7 @@ if cell_type and cell_label and uploaded_files:
                         cell_label,
                         pos_eis_file,
                         neg_eis_file,
-                        discard_left,
-                        discard_right,
-                        fit_choice,
+                        fit_settings,
                     )
                     summary_df, raw_df, plot_buf, avg_rho = analyze_current_fraction_mpr(
                         cf_run_files, resistances, int(avg_points), iss_method
@@ -1809,12 +1847,7 @@ if cell_type and cell_label and uploaded_files:
                             ),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    "Semi-ellipse fit",
-                                    fit_choice,
-                                    discard_left,
-                                    discard_right,
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )

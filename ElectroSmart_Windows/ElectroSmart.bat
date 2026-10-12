@@ -36,7 +36,7 @@ if exist "requirements.txt" (
     "%PY%" -m pip install -r requirements.txt
 ) else (
     echo WARNING: requirements.txt not found
-    "%PY%" -m pip install streamlit pandas numpy matplotlib scipy galvani
+    "%PY%" -m pip install streamlit pandas numpy matplotlib scipy galvani impedance
 )
 echo.
 echo [5/6] Shortcut setup...

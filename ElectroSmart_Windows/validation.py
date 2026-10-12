@@ -69,6 +69,7 @@ PEIS_REQUIREMENTS = (
     ColumnRequirement("cycle number", ("cycle number",)),
     ColumnRequirement("Re(Z)/Ohm", ("Re(Z)/Ohm",)),
     ColumnRequirement("-Im(Z)/Ohm", ("-Im(Z)/Ohm",)),
+    ColumnRequirement("freq/Hz", ("freq/Hz",)),
 )
 LIMITING_CP_REQUIREMENTS = (
     ColumnRequirement("time/s", ("time/s",)),

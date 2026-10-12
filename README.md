@@ -3,10 +3,20 @@
 An interface/app for data analysis work in the Balsara Lab.
 
 Author: Hansen Yang, Zirong He    
-Last updated: October 9, 2026  
-Version: 4.5 (v4.5)  
+Last updated: October 11, 2026  
+Version: 4.6 (v4.6)  
 Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.  
 Properties: This app is run locally on your computer, or on the Streamlit website. It is displayed in your default browser.
+
+## Changes in v4.6
+
+1. Added the `ECM fit` technique for EIS data.
+   - The ECM fit is a third choice in `Technique`, next to `Semi-ellipse fit`.
+   - It fits the equivalent circuit R1 + R2|Q2 + R3|Q3 to the whole spectrum. It adds Q4 for the diffusion tail if the data needs it.
+   - EIS Fit (Single File), Preconditioning, Limiting Current, and Current Fraction can use it. Current Fraction now has the `Technique` choice.
+   - See `ECM Fit` in the Analysis Notes.
+2. Added `impedance` (impedance.py) to the necessary libraries.
+3. A PEIS file must now also have the column `freq/Hz`.
 
 ## Changes in v4.5
 
@@ -106,6 +116,7 @@ These are also listed in `requirements.txt`.
 5. scipy
 6. galvani
 7. openpyxl
+8. impedance
 
 ## Operating Instructions for Windows
 
@@ -151,7 +162,7 @@ The file contains these parts:
 1. Header: the ElectroSmart version, the analysis name, the time of the analysis, the cell type, and the cell label.
 2. `Files Used in This Analysis`: the files that the analysis used.
 3. `Input Parameters`: the values that you entered for this analysis.
-4. `EIS Fitting`: the technique, the points to discard (left and right), and the fit choice. This part shows only if the analysis fits EIS data.
+4. `EIS Fitting`: the technique and its settings. For the semi-ellipse fit, the settings are the points to discard (left and right) and the fit choice. For the ECM fit, the settings are the circuit, the fit range, the weighting, the R1 start value, and the bulk arc limit. This part shows only if the analysis fits EIS data.
 5. `All Uploaded .mpr Files`: the name of each uploaded file, including the files that the analysis did not use.
 6. `Warnings Shown at Download`: each warning and error that the app shows when you download the file. If there are none, this part shows `None`.
 
@@ -182,7 +193,7 @@ The app shows a warning that lists the empty files and the unreadable files. The
 
 Each analysis uses these checks as follows:
 
-- EIS Fit (Single File) and Preconditioning: The app does not show a bad file in the PEIS file list. The file that you select must have the columns `cycle number`, `Re(Z)/Ohm`, and `-Im(Z)/Ohm`.
+- EIS Fit (Single File) and Preconditioning: The app does not show a bad file in the PEIS file list. The file that you select must have the columns `cycle number`, `Re(Z)/Ohm`, `-Im(Z)/Ohm`, and `freq/Hz`.
 - Limiting Current: See the rules below.
 - Current Fraction and Diffusion Coefficient: These analyses do not use the checks yet. A bad file can make the analysis fail with an error message. Remove the bad file and upload the files again.
 
@@ -196,6 +207,36 @@ Rules for Limiting Current:
 6. The app shows a warning that lists each run it cannot fully use, and the reason.
 
 The metadata file records all of these warnings.
+
+### ECM Fit
+
+The ECM fit is a complex nonlinear least-squares fit of an equivalent circuit. It uses the `impedance` library. The semi-ellipse fit uses only the arc part of the spectrum. The ECM fit uses the whole spectrum.
+
+The app does these steps for each cycle:
+
+1. Remove the points where `-Im(Z)` is 0 or less.
+2. Fit R1 + R2|Q2 + R3|Q3. Q is a constant phase element. R1 is free, with a start value of 0.1 Ohm.
+3. Fit R1 + R2|Q2 + R3|Q3 + Q4. Q4 is the diffusion tail at low frequency.
+4. Use the circuit with the lower BIC. The `Q4 used` column shows the choice.
+5. Put the arc with the higher characteristic frequency in R2|Q2.
+6. Calculate the effective capacitance of R2|Q2: C_eff = (R2 Q2)^(1/n2) / R2.
+7. Find R_bulk and R_i with the rule below.
+
+The rule for R_bulk and R_i:
+
+- If C_eff of R2|Q2 is below the limit (default 1 nF), R2|Q2 is the bulk arc. Then R_bulk = R1 + R2, and R_i = R3.
+- If not, the bulk arc is above the measured frequencies. Then R_bulk = R1, and R_i = R2 + R3.
+- R_total = R1 + R2 + R3 in both cases. R_total does not include Q4.
+
+The bulk arc has a small capacitance (pF to less than 1 nF). An interface arc has a larger capacitance (nF to uF). The `Bulk arc` column shows the result of the rule.
+
+The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of |Z - Z_fit| / |Z|. The `Fit note` column shows these conditions:
+
+- `arcs overlap`: the characteristic frequencies of the two arcs are less than 10 times apart. The split between R_bulk and R_i is uncertain.
+- `arc collapsed`: one arc has R near 0, or n at the lower limit.
+- `R_i uncertain`: the standard error of R_i is more than 50% of R_i.
+
+The ECM fit is slower than the semi-ellipse fit. Each cycle takes approximately 2 to 10 seconds.
 
 ### Preconditioning
 
