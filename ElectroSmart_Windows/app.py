@@ -1487,6 +1487,17 @@ if cell_type and cell_label and uploaded_files:
         st.divider()
         st.write("#### B. Potentiometric Data")
 
+        auto_detect_plateau = st.checkbox(
+            "Auto-detect plateau",
+            value=True,
+            key="lim_auto_detect_plateau",
+            help=(
+                "If checked, the app reports the steady-state voltage only for "
+                "the runs that do not diverge. If unchecked, the app reports "
+                "the steady-state voltage for all runs."
+            ),
+        )
+
         if st.button("Process Potentiometric Data", disabled=not pot_bundles):
             with st.spinner("Analyzing Potentiometric Data ..."):
                 confirmed_bundles, cp_summaries, _ = prepare_limiting_current_runs(
@@ -1501,7 +1512,9 @@ if cell_type and cell_label and uploaded_files:
                     cell_label, elyt_thickness, cp_summaries
                 )
                 st.session_state["img_all_CP"] = cp_plot_buf
-                s_df, p_df = analyze_sand_and_polarization(cp_summaries)
+                s_df, p_df = analyze_sand_and_polarization(
+                    cp_summaries, auto_detect_plateau
+                )
                 st.session_state["sands_df"] = s_df
                 st.session_state["fname_sands_csv"] = f"{cell_label}_sands_time.csv"
                 st.session_state["polarization_df"] = p_df
@@ -1528,6 +1541,7 @@ if cell_type and cell_label and uploaded_files:
                 pot_inputs = [
                     ("Active Area (cm^2)", active_area),
                     ("Electrolyte Thickness (cm)", elyt_thickness),
+                    ("Auto-detect Plateau", auto_detect_plateau),
                 ]
                 if not s_df.empty:
                     pot_inputs.append(("Diffusion Coefficient (cm^2/s)", diff_coeff))
@@ -1818,7 +1832,9 @@ if cell_type and cell_label and uploaded_files:
 
                 # --- Display CSV Contents ---
                 st.write("#### Fit Summary Data")
-                st.dataframe(st.session_state["peis_summary_all"], width="stretch")
+                st.dataframe(
+                    st.session_state["peis_summary_all"], width="stretch", hide_index=True
+                )
 
                 has_params = "peis_params_all" in st.session_state
                 if has_params:
@@ -1827,9 +1843,11 @@ if cell_type and cell_label and uploaded_files:
 
                 peis_all_df = st.session_state["peis_summary_all"]
 
+                # Put the ECM parameter CSV next to the summary CSV. Put the
+                # metadata button last.
                 if has_params:
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c5.download_button(
+                    c1, c2, c_params, c3, c4 = st.columns(5)
+                    c_params.download_button(
                         f"Download {cell_label} ECM fit parameters (CSV)",
                         st.session_state["peis_params_all"].to_csv(index=False),
                         f"{cell_label}_ECM_fit_parameters.csv",

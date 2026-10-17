@@ -230,12 +230,12 @@ The app does these steps for each cycle:
 
 The rule for the diffusion tail:
 
-1. Start at the lowest frequency.
-2. Move to higher frequencies while `-Im(Z)` decreases.
-3. The point where `-Im(Z)` stops decreasing is the valley between the last arc and the tail.
+1. Sort the points from high to low frequency.
+2. Find the lowest `-Im(Z)` point in the last two thirds of the spectrum.
+3. This point is the valley between the last arc and the tail.
 4. Do not fit the points at lower frequencies than the valley. The plot shows these points as open gray circles.
 
-The app does not remove a tail of fewer than 3 points, or a tail that rises less than 5% of the highest `-Im(Z)`. The app always keeps the first third of the spectrum. The `Points fitted` and `Tail points removed` columns show the result.
+The app does not remove a tail of fewer than 3 points. The app always keeps the first third of the spectrum. The `Points fitted` and `Tail points removed` columns show the result.
 
 Select `Fit all points` if the spectrum has no clear valley. An example is a quarter circle that rises up to the lowest frequency. If you fit a tail without W, the last arc includes the tail, and R_i is too high.
 
@@ -261,7 +261,6 @@ The fit weights each point by 1/|Z|. The `Fit error (%)` column gives the RMS of
 
 - `arcs overlap`: the characteristic frequencies of the two arcs are less than 10 times apart. The split between R_bulk and R_i is uncertain.
 - `arc collapsed`: one arc has R near 0, or n at the lower limit.
-- `R_i uncertain`: the standard error of R_i is more than 50% of R_i.
 - `no interface arc`: the circuit has one arc, and that arc is the bulk arc. Then R_i is 0. Use a circuit with two arcs.
 
 In the cycle plot, the red line is the full circuit. Each gray dashed line is one R|Q arc at its position on the real axis. The gray dotted line is the Warburg tail.

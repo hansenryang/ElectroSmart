@@ -774,11 +774,10 @@ def ecm_rq_impedance(f: np.ndarray, r: float, q: float, n: float) -> np.ndarray:
 def find_diffusion_tail(f: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Find the points of the low-frequency diffusion tail.
 
-    Sort the points from high to low frequency. Start at the lowest
-    frequency. Move to higher frequencies while -Im(Z) decreases. The
-    point where -Im(Z) stops decreasing is the valley between the last
-    arc and the tail. The points below the valley frequency are the
-    tail.
+    Sort the points from high to low frequency. Find the lowest -Im(Z)
+    point in the last two thirds of the spectrum. This point is the
+    valley between the last arc and the tail. The points below the
+    valley frequency are the tail.
 
     Args:
         f: The frequencies, in Hz.
@@ -798,13 +797,15 @@ def find_diffusion_tail(f: np.ndarray, y: np.ndarray) -> np.ndarray:
     smooth = np.array(
         [np.median(y_sorted[max(0, i - 1) : i + 2]) for i in range(n_pts)]
     )
-    valley = n_pts - 1
-    while valley > 0 and smooth[valley - 1] <= smooth[valley]:
-        valley -= 1
-    n_tail = n_pts - 1 - valley
-    rise = y_sorted[-1] - y_sorted[valley]
+    # A noisy flat tail rises and falls, so do not stop at the first rise.
     # Keep at least the first third of the spectrum for the arcs.
-    if n_tail < 3 or rise < 0.05 * y_sorted.max() or valley < n_pts // 3:
+    start = n_pts // 3
+    valley = start + int(np.argmin(smooth[start:]))
+    # The median can shift the valley by one point. Use the raw minimum.
+    lo = max(start, valley - 1)
+    valley = lo + int(np.argmin(y_sorted[lo : valley + 2]))
+    n_tail = n_pts - 1 - valley
+    if n_tail < 3:
         return is_tail
     is_tail[order[valley + 1 :]] = True
     return is_tail
@@ -966,8 +967,6 @@ def ecm_fit(
                     notes.append("arc collapsed")
             elif bulk_arc:
                 notes.append("no interface arc")
-            if r_i > 0 and (not np.isfinite(se_ri) or se_ri > 0.5 * r_i):
-                notes.append("R_i uncertain")
 
             summary.update(
                 {
@@ -1306,7 +1305,8 @@ def is_diverging(
 
 
 def analyze_sand_and_polarization(
-    cp_results: list[tuple[pd.DataFrame, float]]
+    cp_results: list[tuple[pd.DataFrame, float]],
+    auto_detect_plateau: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Find the Sand's time and the steady-state polarization for each run.
 
@@ -1317,6 +1317,8 @@ def analyze_sand_and_polarization(
 
     Args:
         cp_results: A list of (dataframe, current density) pairs.
+        auto_detect_plateau: If True, record the steady-state voltage only
+            for the runs that do not diverge. If False, record it for all runs.
 
     Returns:
         A dataframe of Sand's times and a dataframe of steady-state
@@ -1353,8 +1355,11 @@ def analyze_sand_and_polarization(
         t_end_s = df["norm_time_h"].iloc[-1] * 3600
         df_final = df[(df["norm_time_h"] * 3600) >= (t_end_s - 120)]
 
-        if not df_final.empty and not is_diverging(
-            (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+        if not df_final.empty and not (
+            auto_detect_plateau
+            and is_diverging(
+                (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+            )
         ):
             v_avg = df_final["Ewe/V"].mean()
             pols.append(
