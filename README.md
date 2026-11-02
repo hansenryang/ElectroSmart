@@ -3,7 +3,7 @@
 An interface/app for data analysis work in the Balsara Lab.
 
 Author: Hansen Yang, Zirong He<br>
-Last updated: October 9, 2026<br>
+Last updated: Nov 2, 2026<br>
 Version: 4.6 (v4.6)<br>
 Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.<br>
 Properties: This app is run locally on your computer, or on the Streamlit website. It is displayed in your default browser.
