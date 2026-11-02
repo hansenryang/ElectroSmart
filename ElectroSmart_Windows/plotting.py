@@ -1,0 +1,2251 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import io
+from galvani import BioLogic
+from scipy.optimize import fsolve, fmin, curve_fit, least_squares
+from scipy.signal import find_peaks, savgol_filter
+import re
+from typing import Any, Callable, IO, Optional, Union
+
+# The ECM circuits. Each value is the number of R|Q arcs, and True if the
+# circuit has a semi-infinite Warburg element W. See ecm_model.
+#
+# Credit: the ECM fit is a cheaper and faster version of the circuit fit in
+# impedance.py (Murbach et al., "impedance.py: A Python package for
+# electrochemical impedance analysis", J. Open Source Softw. 5 (2020) 2349,
+# https://github.com/ECSHackWeek/impedance.py, MIT license). The element
+# equations (R, CPE, W), the 1/|Z| weighting, and the standard errors follow
+# impedance.py. This code evaluates the circuits directly with numpy. It
+# does not build the circuit from a text string for each call, so the fit
+# is approximately 3 to 10 times faster.
+ECM_BULK_INTERFACE = "Rb|Qb + Ri|Qi + W"
+
+ECM_CIRCUITS: dict[str, tuple[int, bool]] = {
+    ECM_BULK_INTERFACE: (2, True),
+    "R1 + R2|Q2 + R3|Q3": (2, False),
+    "R1 + R2|Q2 + R3|Q3 + W": (2, True),
+    "R1 + R2|Q2": (1, False),
+    "R1 + R2|Q2 + W": (1, True),
+}
+ECM_R1_START = 0.1
+
+# The units of the ECM parameters, for the tables and the plot legends.
+ECM_UNITS = {"R": "Ohm", "Q": "Ohm^-1 s^n", "n": "-", "A_W": "Ohm s^-1/2"}
+
+# The column names with units for the summary tables of both fits. The
+# analyses calculate with the names without units.
+SUMMARY_UNITS = {
+    "R_bulk": "R_bulk (Ohm)",
+    "R_i": "R_i (Ohm)",
+    "R_total": "R_total (Ohm)",
+    "R_bulk + R_i": "R_bulk + R_i (Ohm)",
+    "R_bulk_arc": "R_bulk_arc (Ohm)",
+    "R_i_arc": "R_i_arc (Ohm)",
+}
+
+# Global style updates
+plt.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial"],
+        "font.size": 12,
+        "figure.dpi": 100,
+        "savefig.dpi": 300,
+        "legend.framealpha": 0.8,
+        "legend.edgecolor": "black",
+    }
+)
+
+
+def get_current_from_mpr(file_obj: IO[bytes]) -> float:
+    """Read the median current from an MPR file.
+
+    Find the current column in the file. Return its median value.
+    If no current column exists, return 0.0.
+
+    Args:
+        file_obj: An MPR file object with a seek method.
+
+    Returns:
+        The median current in mA, or 0.0 if no current column exists.
+    """
+    file_obj.seek(0)
+    mpr = BioLogic.MPRfile(file_obj)
+    df = pd.DataFrame(mpr.data)
+    if "I/mA" in df.columns:
+        return df["I/mA"].median()
+    elif "<I>/mA" in df.columns:
+        return df["<I>/mA"].median()
+    return 0.0
+
+
+def plot_all_EIS_precond(
+    cell_type: str, cell_label: str, data_filename: IO[bytes], run_label: str
+) -> io.BytesIO:
+    """Plot all PEIS cycles from one MPR file.
+
+    Read the cycles from the file. Plot each cycle as a scatter series
+    on one chart. Save the chart to a PNG buffer.
+
+    Args:
+        cell_type: The type of cell under test.
+        cell_label: The label of the cell under test.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+
+    Returns:
+        A PNG image buffer of the combined cycle plot.
+    """
+    data_filename.seek(0)
+    mpr = BioLogic.MPRfile(data_filename)
+    df = pd.DataFrame(mpr.data)
+    cycle_no = sorted(list(set(df["cycle number"].values)))
+    data_list = [df[df["cycle number"] == c] for c in cycle_no]
+    range_x_max = max([(max(d["Re(Z)/Ohm"]) - min(d["Re(Z)/Ohm"])) for d in data_list])
+    range_y_max = max(
+        [(max(d["-Im(Z)/Ohm"]) - min(d["-Im(Z)/Ohm"])) for d in data_list]
+    )
+    fig = plt.figure(figsize=(5 * range_x_max / range_y_max, 5))
+    ax = fig.add_subplot(111)
+    for i, df1 in enumerate(data_list):
+        ax.scatter(
+            df1["Re(Z)/Ohm"], df1["-Im(Z)/Ohm"], label=f"Cycle {int(cycle_no[i])}", s=15
+        )
+    ax.set_title(f"{cell_label} {run_label} PEIS all cycles")
+    ax.set_xlabel("Re(Z)/Ohm")
+    ax.set_ylabel("-Im(Z)/Ohm")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    ncol = 2 if len(data_list) > 12 else 1
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), ncol=ncol)
+    img_buffer = io.BytesIO()
+    fig.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight")
+    img_buffer.seek(0)
+    plt.close(fig)
+    return img_buffer
+
+
+def plot_all_CP_LC(
+    cell_label: str,
+    elyt_thickness: float,
+    cp_summaries: list[tuple[pd.DataFrame, float]],
+) -> io.BytesIO:
+    """Plot the combined CP curves for a Limiting Current run.
+
+    Plot V/L against time for each current density in the run.
+
+    Args:
+        cell_label: The label of the cell under test.
+        elyt_thickness: The electrolyte thickness, in cm.
+        cp_summaries: A list of (dataframe, current density) pairs.
+
+    Returns:
+        A PNG image buffer of the combined plot.
+    """
+    fig_vl, ax_vl = plt.subplots(figsize=(10, 6))
+    for df, d in cp_summaries:
+        ax_vl.plot(
+            df["norm_time_h"],
+            df["Ewe/V"].abs() / elyt_thickness,
+            label=f"{abs(d):.2f} mA/cm²",
+        )
+
+    ax_vl.set_title(f"Limiting Current of {cell_label}")
+    ax_vl.set_xlabel("Time (h)")
+    ax_vl.set_ylabel("V/L (V/cm)")
+    ax_vl.set_xlim(left=0)
+
+    num_items = len(cp_summaries)
+    n_cols = (num_items // 20) + (1 if num_items % 20 > 0 else 0)
+    ax_vl.legend(
+        loc="upper left", bbox_to_anchor=(1.02, 1), ncol=n_cols, fontsize="x-small"
+    )
+
+    cp_plot_buf = io.BytesIO()
+    fig_vl.savefig(cp_plot_buf, format="png", dpi=300, bbox_inches="tight")
+    cp_plot_buf.seek(0)
+    plt.close(fig_vl)
+    return cp_plot_buf
+
+
+def semi_ellipse(
+    x: np.ndarray, xc: float, yc: float, Rx: float, Ry: float
+) -> np.ndarray:
+    """Compute the upper half of an ellipse at each x value.
+
+    Args:
+        x: The x values to evaluate.
+        xc: The x coordinate of the ellipse center.
+        yc: The y coordinate of the ellipse center.
+        Rx: The x radius of the ellipse.
+        Ry: The y radius of the ellipse.
+
+    Returns:
+        The y values on the upper half of the ellipse.
+    """
+    z = (x - xc) / Rx
+    return yc + Ry * np.sqrt(np.maximum(1 - z**2, 0))
+
+
+def solve_ellipse_xints(
+    xc: float, yc: float, Rx: float, Ry: float
+) -> tuple[float, float]:
+    """Find the left and right x-intercepts of an ellipse at y = 0.
+
+    Args:
+        xc: The x coordinate of the ellipse center.
+        yc: The y coordinate of the ellipse center.
+        Rx: The x radius of the ellipse.
+        Ry: The y radius of the ellipse.
+
+    Returns:
+        The left x-intercept and the right x-intercept.
+    """
+    term = np.sqrt(abs(1 - (yc / Ry) ** 2))
+    return xc - Rx * term, xc + Rx * term
+
+
+def obj_one_ellipse(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a one-ellipse fit.
+
+    Reject invalid radii with a large penalty value.
+
+    Args:
+        params: The fit parameters xc, yc, Rx, Ry.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors, or 1e12 for invalid radii.
+    """
+    xc, yc, Rx, Ry = params
+    if Rx <= 0 or Ry <= 0:
+        return 1e12
+    return np.sum((y - semi_ellipse(x, xc, yc, Rx, Ry)) ** 2)
+
+
+def obj_two_ellipses(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the sum of squared errors for a two-ellipse fit.
+
+    Take the upper envelope of the two ellipses at each x value. Reject
+    invalid radii with a large penalty value.
+
+    Args:
+        params: The fit parameters for both ellipses.
+        x: The measured x values.
+        y: The measured y values.
+
+    Returns:
+        The sum of squared errors, or 1e12 for invalid radii.
+    """
+    xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = params
+    if any(p <= 0 for p in [Rx1, Ry1, Rx2, Ry2]):
+        return 1e12
+    y1 = semi_ellipse(x, xc1, yc1, Rx1, Ry1)
+    y2 = semi_ellipse(x, xc2, yc2, Rx2, Ry2)
+    return np.sum((y - np.maximum(y1, y2)) ** 2)
+
+
+def calculate_bic(rss: float, n: int, k: int) -> float:
+    """Calculate the Bayesian Information Criterion for a fit.
+
+    Args:
+        rss: The residual sum of squares from the fit.
+        n: The number of data points.
+        k: The number of free parameters in the fit.
+
+    Returns:
+        The BIC value. Return 1e12 if rss is not positive.
+    """
+    if rss <= 0:
+        return 1e12
+    return n * np.log(rss / n) + k * np.log(n)
+
+
+def find_both_mins(df: pd.DataFrame, peak_idx: int) -> tuple[int, int]:
+    """Find the left and right local minimum points around a peak.
+
+    Search left from the peak for the lowest point. Search right from
+    the peak for the lowest point.
+
+    Args:
+        df: A dataframe with the imaginary impedance in column 1.
+        peak_idx: The row index of the peak.
+
+    Returns:
+        The row index of the left minimum and the row index of the
+        right minimum.
+    """
+    Im_Z = df.iloc[:, 1].values
+    n_rows = len(Im_Z)
+    left_min_idx = 0
+    left_min_val = Im_Z[0]
+    for i in range(peak_idx):
+        if Im_Z[i] < left_min_val:
+            left_min_val = Im_Z[i]
+            left_min_idx = i
+    right_min_idx = peak_idx
+    right_min_val = Im_Z[peak_idx]
+    for i in range(peak_idx, n_rows):
+        if Im_Z[i] < right_min_val:
+            right_min_val = Im_Z[i]
+            right_min_idx = i
+    return left_min_idx, right_min_idx
+
+
+def semiellipse_fit(
+    cell_type: str,
+    cell_label: str,
+    no_left_idx_to_throw: int,
+    no_right_idx_to_throw: int,
+    data_filename: IO[bytes],
+    run_label: str,
+    must_use_dual: bool,
+    must_use_single: bool,
+    cycle_title: Optional[str] = None,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
+    """Fit each PEIS cycle in an MPR file with one or two semi-ellipses.
+
+    For each cycle, trim points near the ends. Fit a single ellipse and
+    a two-ellipse model. Choose the model with the lower BIC score,
+    unless the caller forces one model. Compute R_bulk and R_i from the
+    fit. Plot each cycle fit and the trend across cycles.
+
+    Args:
+        cell_type: The type of analysis, for example "Preconditioning".
+        cell_label: The label of the cell under test.
+        no_left_idx_to_throw: The number of points to discard from the
+            left.
+        no_right_idx_to_throw: The number of points to discard from the
+            right.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+        must_use_dual: Force the two-ellipse model for every cycle.
+        must_use_single: Force the one-ellipse model for every cycle.
+        cycle_title: The title for each cycle plot. If None, use the
+            cell label, the run label, and the cycle number.
+        progress: A function that the fit calls before each cycle with
+            the number of finished cycles, the cycle count, and the cycle
+            number.
+
+    Returns:
+        A tuple with the summary dataframe, the trend plot buffer, the
+        summary CSV buffer, and a list of (file name, image buffer)
+        pairs for each cycle.
+    """
+    data_filename.seek(0)
+    mpr = BioLogic.MPRfile(data_filename)
+    df_raw = pd.DataFrame(mpr.data)
+    cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
+    results_list = []
+    cycle_images = []
+    for i, c in enumerate(cycle_nums):
+        if progress is not None:
+            progress(i, len(cycle_nums), int(c))
+        df_cycle = df_raw[df_raw["cycle number"] == c].reset_index(drop=True)
+        df_clean = df_cycle[["Re(Z)/Ohm", "-Im(Z)/Ohm"]]
+        no_rows = len(df_clean)
+        l_idx, r_idx = find_both_mins(df_clean, peak_idx=no_rows // 4)
+        if no_rows > 10:
+            l_idx += no_left_idx_to_throw
+            r_idx -= no_right_idx_to_throw
+        l_idx = max(0, l_idx)
+        r_idx = min(no_rows - 1, r_idx)
+        idx_list = range(l_idx, r_idx + 1)
+        df_masked = df_clean.iloc[idx_list, :]
+        x_fit = df_masked.iloc[:, 0].values
+        y_fit = df_masked.iloc[:, 1].values
+        n = len(x_fit)
+        start_val, end_val = x_fit[0], x_fit[-1]
+        res_one = fmin(
+            obj_one_ellipse,
+            [(start_val + end_val) / 2, 0, (end_val - start_val) / 2, np.max(y_fit)],
+            args=(x_fit, y_fit),
+            disp=False,
+        )
+        bic_one = calculate_bic(obj_one_ellipse(res_one, x_fit, y_fit), n, 4)
+        mid_x = (start_val + end_val) / 2
+        guess_two = [
+            (start_val + mid_x) / 2,
+            0,
+            (mid_x - start_val) / 2,
+            np.max(y_fit) * 0.5,
+            (mid_x + end_val) / 2,
+            0,
+            (end_val - mid_x) / 2,
+            np.max(y_fit),
+        ]
+        res_two = fmin(
+            obj_two_ellipses, guess_two, args=(x_fit, y_fit), disp=False, maxiter=2000
+        )
+        bic_two = calculate_bic(obj_two_ellipses(res_two, x_fit, y_fit), n, 8)
+        use_dual = (bic_two < bic_one or must_use_dual) and not must_use_single
+        if use_dual:
+            xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = res_two
+            l1, r1 = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
+            l2, r2 = solve_ellipse_xints(xc2, yc2, Rx2, Ry2)
+            r_bulk_raw = l1 if abs(l1 - start_val) <= abs(l2 - start_val) else l2
+            r_total_raw = r1 if abs(r1 - end_val) <= abs(r2 - end_val) else r2
+        else:
+            xc1, yc1, Rx1, Ry1 = res_one
+            r_bulk_raw, r_total_raw = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
+            xc2 = yc2 = Rx2 = Ry2 = np.nan
+        r_bulk = r_bulk_raw if r_bulk_raw >= 0 else x_fit[0]
+        ri = r_total_raw - r_bulk
+        r_bulk_arc = np.min(x_fit)
+        ri_arc = r_total_raw - r_bulk_arc
+        fig_ind = plt.figure(figsize=(8, 4))
+        plt.scatter(
+            df_clean.iloc[:, 0], df_clean.iloc[:, 1], color="lightgray", alpha=0.3
+        )
+        plt.scatter(x_fit, y_fit, color="darkblue", s=10)
+        x_plot = np.linspace(r_bulk, r_total_raw, 500)
+        y_p = (
+            np.maximum(
+                semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1),
+                semi_ellipse(x_plot, xc2, yc2, Rx2, Ry2),
+            )
+            if use_dual
+            else semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1)
+        )
+        lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
+        plt.plot(x_plot, y_p, "r-", label=lbl)
+        plt.title(
+            cycle_title
+            if cycle_title is not None
+            else f"{cell_label} {run_label} Cycle {int(c)}"
+        )
+        plt.xlabel("Re(Z)/Ohm")
+        plt.ylabel("-Im(Z)/Ohm")
+        plt.gca().set_aspect("equal")
+        plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1))
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
+        fig_ind.clear()
+        plt.close(fig_ind)
+        results_list.append(
+            {
+                "Cycle": int(c),
+                "R_bulk": r_bulk,
+                "R_i": ri,
+                "R_total": r_total_raw,
+                "R_bulk_arc": r_bulk_arc,
+                "R_i_arc": ri_arc,
+            }
+        )
+    summary_df = pd.DataFrame(results_list).sort_values(by="Cycle")
+    sum_buf, csv_buf = plot_resistance_trend(summary_df, cell_label, run_label)
+    return summary_df, sum_buf, csv_buf, cycle_images
+
+
+def plot_resistance_trend(
+    summary_df: pd.DataFrame, cell_label: str, run_label: str
+) -> tuple[io.BytesIO, io.StringIO]:
+    """Plot R_bulk and R_i against the cycle number.
+
+    Args:
+        summary_df: A dataframe with the columns Cycle, R_bulk, and R_i.
+        cell_label: The label of the cell under test.
+        run_label: The label for this run, for example "Positive".
+
+    Returns:
+        A PNG image buffer of the trend plot, and a CSV buffer of the
+        summary dataframe.
+    """
+    fig_sum, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = ax1.twinx()
+    ax1.plot(
+        summary_df["Cycle"], summary_df["R_i"], "o-", color="crimson", label="$R_i$"
+    )
+    ax2.plot(
+        summary_df["Cycle"],
+        summary_df["R_bulk"],
+        "s--",
+        color="navy",
+        label="$R_{bulk}$",
+    )
+    ax1.set_xlabel("Cycle Number")
+    ax1.set_ylabel("$R_i$ / Ohm", color="crimson")
+    ax2.set_ylabel("$R_{bulk}$ / Ohm", color="navy")
+    ax1.set_title(f"{cell_label} {run_label} PEIS Trend")
+    sum_buf = io.BytesIO()
+    plt.savefig(sum_buf, format="png", bbox_inches="tight")
+    sum_buf.seek(0)
+    csv_buf = io.StringIO()
+    summary_df.to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    fig_sum.clear()
+    plt.close(fig_sum)
+    return sum_buf, csv_buf
+
+
+def ecm_initial_guesses(
+    f: np.ndarray, Z: np.ndarray, n_arcs: int, warburg: bool
+) -> list[list[float]]:
+    """Make three starting points for the ECM fit.
+
+    Make three starts from the valleys of -Im(Z). Do not cut the data
+    with the valleys. If the circuit has no Warburg element, make two
+    more starts from the lowest Re(Z), the highest Re(Z), and the apex
+    of -Im(Z). These two starts suit data without a diffusion tail.
+
+    Args:
+        f: The frequencies, in Hz.
+        Z: The complex impedances, in Ohm.
+        n_arcs: The number of R|Q arcs in the circuit, 1 or 2.
+        warburg: Add a starting value for the Warburg coefficient.
+
+    Returns:
+        A list of parameter lists in the order R1, R2, Q2, n2, then R3,
+        Q3, n3 if n_arcs is 2, then A_W if warburg is True.
+    """
+    x = Z.real
+    y = -Z.imag
+    n_pts = len(x)
+    l_idx, r_idx = find_both_mins(pd.DataFrame({"x": x, "y": y}), n_pts // 4)
+    starts = []
+    r_hf = x[l_idx]
+    r_lf = x[r_idx] if r_idx > l_idx else x.max()
+    seg = slice(l_idx, r_idx + 1) if r_idx > l_idx else slice(0, n_pts)
+    f_apex = f[seg][np.argmax(y[seg])]
+    for r1, share in (
+        (ECM_R1_START, 0.0),
+        (max(r_hf, 1e-3), 0.25),
+        (max(r_hf * 0.5, 1e-3), 0.5),
+    ):
+        starts.append((r1, share, r_hf, r_lf, f_apex))
+    if not warburg:
+        r_hf_all = x.min()
+        f_apex_all = f[np.argmax(y)]
+        for r1, share in ((max(r_hf_all, 1e-3), 0.1), (max(r_hf_all * 0.5, 1e-3), 0.5)):
+            starts.append((r1, share, r_hf_all, x.max(), f_apex_all))
+
+    n0 = 0.85
+    guesses = []
+    for r1, share, r_hf, r_lf, f_apex in starts:
+        width = max(r_lf - r_hf, 1e-6)
+        if n_arcs == 2:
+            r2 = max(r_hf - r1 + share * width, 1e-4)
+            r3 = max(r_lf - r1 - r2, 1e-4)
+            q2 = min((1 / (2 * np.pi * f_apex * 100)) ** n0 / r2, 0.5)
+            q3 = min((1 / (2 * np.pi * f_apex)) ** n0 / r3, 0.5)
+            guess = [r1, r2, q2, n0, r3, q3, n0]
+        else:
+            r2 = max(r_lf - r1, 1e-4)
+            q2 = min((1 / (2 * np.pi * f_apex)) ** n0 / r2, 0.5)
+            guess = [r1, r2, q2, n0]
+        if warburg:
+            w_min = 2 * np.pi * f.min()
+            guess.append(max(y[-1], width * 0.05) * np.sqrt(w_min))
+        # galvani gives float32 values. impedance.py accepts only Python floats.
+        guesses.append([float(v) for v in guess])
+    return guesses
+
+
+def ecm_parameter_names(n_arcs: int, warburg: bool) -> list[tuple[str, str]]:
+    """List the names and units of the parameters of one ECM circuit.
+
+    Args:
+        n_arcs: The number of R|Q arcs, 1 or 2.
+        warburg: The circuit has a Warburg element.
+
+    Returns:
+        A list of (name, unit) pairs in the parameter order of
+        ecm_model.
+    """
+    names = [("R1", "R"), ("R2", "R"), ("Q2", "Q"), ("n2", "n")]
+    if n_arcs == 2:
+        names += [("R3", "R"), ("Q3", "Q"), ("n3", "n")]
+    if warburg:
+        names.append(("A_W", "A_W"))
+    return [(name, ECM_UNITS[kind]) for name, kind in names]
+
+
+def ecm_circuit_string(n_arcs: int, warburg: bool) -> str:
+    """Give the circuit string of one ECM circuit.
+
+    Use the syntax of impedance.py with the element names of the app.
+    For example, R1 + R2|Q2 + R3|Q3 + W gives "R1-p(R2,Q2)-p(R3,Q3)-W".
+
+    Args:
+        n_arcs: The number of R|Q arcs, 1 or 2.
+        warburg: The circuit has a Warburg element.
+
+    Returns:
+        The circuit string.
+    """
+    text = "R1-p(R2,Q2)"
+    if n_arcs == 2:
+        text += "-p(R3,Q3)"
+    if warburg:
+        text += "-W"
+    return text
+
+
+def ecm_model(
+    params: np.ndarray, f: np.ndarray, n_arcs: int, warburg: bool
+) -> np.ndarray:
+    """Calculate the impedance of one circuit from ECM_CIRCUITS.
+
+    Use Z = R1 + R2 / (1 + R2 Q2 (j w)^n2) + R3 / (1 + R3 Q3 (j w)^n3)
+    + A_W (1 - j) / sqrt(w). Omit the R3|Q3 term if n_arcs is 1. Omit
+    the W term if warburg is False.
+
+    This function is a cheaper and faster version of the circuit
+    evaluation in impedance.py. The equations are the same as the R,
+    CPE, and W elements of impedance.py. The results agree to machine
+    precision. See the credit note above ECM_CIRCUITS.
+
+    Args:
+        params: The parameters in the order R1, R2, Q2, n2, then R3,
+            Q3, n3 if n_arcs is 2, then A_W if warburg is True.
+        f: The frequencies, in Hz.
+        n_arcs: The number of R|Q arcs, 1 or 2.
+        warburg: The circuit has a Warburg element.
+
+    Returns:
+        The complex impedance at each frequency, in Ohm.
+    """
+    omega = 2 * np.pi * f
+    z = params[0] + ecm_rq_impedance(f, params[1], params[2], params[3])
+    if n_arcs == 2:
+        z = z + ecm_rq_impedance(f, params[4], params[5], params[6])
+    if warburg:
+        z = z + params[-1] * (1 - 1j) / np.sqrt(omega)
+    return z
+
+
+def fit_ecm_spectrum(
+    f: np.ndarray,
+    Z: np.ndarray,
+    circuit_label: str,
+    previous: Optional[list[float]] = None,
+) -> dict[str, Any]:
+    """Fit one equivalent circuit from ECM_CIRCUITS to one spectrum.
+
+    Fit the circuit from each starting point with a complex nonlinear
+    least-squares fit (scipy least_squares). Weight each point by
+    1/|Z|. Keep the fit with the lowest weighted residual. In a circuit
+    with two arcs, put the arc with the higher characteristic frequency
+    in R2|Q2.
+
+    This function is a cheaper and faster version of
+    CustomCircuit.fit(weight_by_modulus=True) in impedance.py. See the
+    credit note above ECM_CIRCUITS.
+
+    Args:
+        f: The frequencies, in Hz.
+        Z: The complex impedances, in Ohm.
+        circuit_label: A key of ECM_CIRCUITS.
+        previous: The best parameters of the previous cycle.
+
+    Returns:
+        A dictionary with the parameters, the standard errors, the
+        initial guesses of the best start, the convergence flag, a
+        function that calculates the fitted impedance at given
+        frequencies, and the parameters in the fit order.
+
+    Raises:
+        RuntimeError: No fit converged.
+    """
+    if circuit_label == ECM_BULK_INTERFACE:
+        from bulk_interface import fit_spectrum
+        return fit_spectrum(f, Z)
+    n_arcs, warburg = ECM_CIRCUITS[circuit_label]
+    lower = [0, 0, 1e-15, 0.3] + ([0, 1e-15, 0.3] if n_arcs == 2 else [])
+    upper = [np.inf, np.inf, 1, 1] + ([np.inf, 1, 1] if n_arcs == 2 else [])
+    if warburg:
+        lower.append(0)
+        upper.append(np.inf)
+    guesses = ecm_initial_guesses(f, Z, n_arcs, warburg)
+    if previous is not None and len(previous) == len(lower):
+        guesses.insert(0, list(previous))
+    weight = np.abs(Z)
+
+    def residuals(p: np.ndarray) -> np.ndarray:
+        d = (Z - ecm_model(p, f, n_arcs, warburg)) / weight
+        return np.concatenate([d.real, d.imag])
+
+    best = None
+    best_guess = None
+    for guess in guesses:
+        guess = np.clip(guess, lower, upper)
+        try:
+            result = least_squares(
+                residuals,
+                guess,
+                bounds=(lower, upper),
+                method="trf",
+                x_scale="jac",
+                max_nfev=5000,
+            )
+        except Exception:
+            continue
+        if best is None or result.cost < best.cost:
+            best = result
+            best_guess = [float(v) for v in guess]
+    if best is None:
+        raise RuntimeError("No ECM fit converged.")
+
+    fit_params = [float(v) for v in best.x]
+    # Standard errors as in curve_fit with relative sigma (impedance.py):
+    # cov = (J^T J)^-1 * RSS / (N - p), from the SVD of J. Scale each column
+    # by its parameter value first, because Q (about 1e-10) and R (about
+    # 1e3) differ by many orders of magnitude.
+    n_res = len(best.fun)
+    dof = max(n_res - len(fit_params), 1)
+    scale = np.where(np.abs(best.x) > 0, np.abs(best.x), 1.0)
+    try:
+        _, sing, vt = np.linalg.svd(best.jac * scale, full_matrices=False)
+        threshold = np.finfo(float).eps * max(best.jac.shape) * sing[0]
+        keep_sv = sing > threshold
+        cov_scaled = (vt[keep_sv].T / sing[keep_sv] ** 2) @ vt[keep_sv]
+        cov = cov_scaled * np.outer(scale, scale) * (2 * best.cost / dof)
+        conf = [float(v) for v in np.sqrt(np.abs(np.diag(cov)))]
+    except np.linalg.LinAlgError:
+        conf = [np.nan] * len(fit_params)
+    params = list(fit_params)
+    initial = list(best_guess)
+
+    # Put the arc with the higher characteristic frequency first.
+    if n_arcs == 2 and (
+        ecm_arc_frequency(*params[4:7]) > ecm_arc_frequency(*params[1:4])
+    ):
+        params[1:4], params[4:7] = params[4:7], params[1:4]
+        conf[1:4], conf[4:7] = conf[4:7], conf[1:4]
+        initial[1:4], initial[4:7] = initial[4:7], initial[1:4]
+    return {
+        "params": params,
+        "conf": conf,
+        "initial": initial,
+        "success": bool(best.success),
+        "predict": lambda freq: ecm_model(best.x, freq, n_arcs, warburg),
+        "fit_params": fit_params,
+    }
+
+
+def ecm_arc_frequency(r: float, q: float, n: float) -> float:
+    """Calculate the characteristic frequency of one R|Q arc.
+
+    Args:
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The frequency 1 / (2 pi (R Q)^(1/n)), in Hz. Return inf if R
+        is 0.
+    """
+    if r <= 1e-12:
+        return np.inf
+    return 1 / (2 * np.pi * (r * q) ** (1 / n))
+
+
+def ecm_effective_capacitance(r: float, q: float, n: float) -> float:
+    """Calculate the effective capacitance of one R|Q arc.
+
+    Use the peak-frequency equivalent capacitance C = (R Q)^(1/n) / R.
+
+    Args:
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The effective capacitance, in F. Return NaN if R is 0.
+    """
+    if r <= 1e-12:
+        return np.nan
+    return (r * q) ** (1 / n) / r
+
+
+def ecm_rq_impedance(f: np.ndarray, r: float, q: float, n: float) -> np.ndarray:
+    """Calculate the impedance of one R|Q arc.
+
+    Args:
+        f: The frequencies, in Hz.
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The complex impedance at each frequency, in Ohm.
+    """
+    return r / (1 + r * q * (2j * np.pi * f) ** n)
+
+
+def find_diffusion_tail(f: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Find the points of the low-frequency diffusion tail.
+
+    Sort the points from high to low frequency. Find the lowest -Im(Z)
+    point in the last two thirds of the spectrum. This point is the
+    valley between the last arc and the tail. The points below the
+    valley frequency are the tail.
+
+    Args:
+        f: The frequencies, in Hz.
+        y: The values of -Im(Z), in Ohm.
+
+    Returns:
+        A boolean array in the order of the input. True marks a tail
+        point. All values are False if the spectrum has no tail.
+    """
+    is_tail = np.zeros(len(f), dtype=bool)
+    order = np.argsort(-f)
+    y_sorted = y[order]
+    n_pts = len(y_sorted)
+    if n_pts < 6:
+        return is_tail
+    # A 3-point median removes single noisy points.
+    smooth = np.array(
+        [np.median(y_sorted[max(0, i - 1) : i + 2]) for i in range(n_pts)]
+    )
+    # A noisy flat tail rises and falls, so do not stop at the first rise.
+    # Keep at least the first third of the spectrum for the arcs.
+    start = n_pts // 3
+    valley = start + int(np.argmin(smooth[start:]))
+    # The median can shift the valley by one point. Use the raw minimum.
+    lo = max(start, valley - 1)
+    valley = lo + int(np.argmin(y_sorted[lo : valley + 2]))
+    n_tail = n_pts - 1 - valley
+    if n_tail < 3:
+        return is_tail
+    is_tail[order[valley + 1 :]] = True
+    return is_tail
+
+
+def ecm_fit(
+    cell_type: str,
+    cell_label: str,
+    data_filename: IO[bytes],
+    run_label: str,
+    circuit_label: str,
+    bulk_c_threshold: Optional[float],
+    remove_tail: bool = True,
+    cycle_title: Optional[str] = None,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    io.BytesIO,
+    io.StringIO,
+    list[tuple[str, io.BytesIO]],
+]:
+    """Fit each PEIS cycle in an MPR file with an equivalent circuit.
+
+    Fit the chosen circuit to the whole spectrum. Drop the points with
+    -Im(Z) <= 0. If the circuit has no Warburg element and remove_tail
+    is True, also drop the low-frequency diffusion tail (see
+    find_diffusion_tail). Use the
+    effective capacitance of R2|Q2 to find the bulk arc. Plot each
+    cycle fit and the trend across cycles.
+
+    Args:
+        cell_type: The type of analysis, for example "Preconditioning".
+        cell_label: The label of the cell under test.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+        circuit_label: A key of ECM_CIRCUITS.
+        bulk_c_threshold: The capacitance limit for the bulk arc, in F.
+            If C_eff of R2|Q2 is below this limit, R2 is bulk resistance.
+        remove_tail: Drop the diffusion tail before the fit. The app
+            uses this value only for a circuit without a Warburg element.
+        cycle_title: The title for each cycle plot. If None, use the
+            cell label, the run label, and the cycle number.
+        progress: A function that the fit calls before each cycle with
+            the number of finished cycles, the cycle count, and the cycle
+            number.
+
+    Returns:
+        A tuple with the summary dataframe (Cycle, R_bulk, R_i, R_total,
+        and Fit error (%)), the fit parameter dataframe, the trend plot
+        buffer, the summary CSV buffer, and a list of (file name, image
+        buffer) pairs for each cycle. The fit parameter dataframe has the
+        value, the standard error, and the initial guess of each
+        parameter, with units in the column names. The summary CSV has
+        units in the column names.
+    """
+    n_arcs, warburg = ECM_CIRCUITS[circuit_label]
+    direct_bulk = circuit_label == ECM_BULK_INTERFACE
+    names = ecm_parameter_names(n_arcs, warburg)
+    if direct_bulk:
+        names = [("fixed offset", "Ohm"), ("Rb", "Ohm"), ("Qb", ECM_UNITS["Q"]),
+                 ("nb", "-"), ("Ri", "Ohm"), ("Qi", ECM_UNITS["Q"]),
+                 ("ni", "-"), ("A_W", ECM_UNITS["A_W"])]
+    n_params = len(names) - int(direct_bulk)
+    circuit_text = "(Rb|Qb) + (Ri|Qi) + W" if direct_bulk else ecm_circuit_string(n_arcs, warburg)
+    data_filename.seek(0)
+    mpr = BioLogic.MPRfile(data_filename)
+    df_raw = pd.DataFrame(mpr.data)
+    cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
+    summary_rows = []
+    param_rows = []
+    cycle_images = []
+    previous = None
+    for i, c in enumerate(cycle_nums):
+        if progress is not None:
+            progress(i, len(cycle_nums), int(c))
+        df_cycle = df_raw[df_raw["cycle number"] == c].reset_index(drop=True)
+        x_all = df_cycle["Re(Z)/Ohm"].values.astype(float)
+        y_all = df_cycle["-Im(Z)/Ohm"].values.astype(float)
+        f_all = df_cycle["freq/Hz"].values.astype(float)
+        valid = np.isfinite(f_all) & (f_all > 0) & np.isfinite(x_all) & np.isfinite(y_all) & (np.hypot(x_all, y_all) > 0)
+        positive = valid if direct_bulk else valid & (y_all > 0)
+        is_tail = np.zeros(len(y_all), dtype=bool)
+        if remove_tail and not warburg:
+            is_tail[positive] = find_diffusion_tail(f_all[positive], y_all[positive])
+        keep = positive & ~is_tail
+        f = f_all[keep]
+        Z = x_all[keep] - 1j * y_all[keep]
+        summary = {"Cycle": int(c)}
+        info = {
+            "Cycle": int(c),
+            "Fit converged": False,
+            "Points fitted": int(keep.sum()),
+            "Tail points removed": int(is_tail.sum()),
+        }
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.scatter(
+            x_all[~positive], y_all[~positive], color="lightgray", alpha=0.5, s=10
+        )
+        if is_tail.any():
+            ax.scatter(
+                x_all[is_tail],
+                y_all[is_tail],
+                facecolors="none",
+                edgecolors="gray",
+                s=14,
+                label="Diffusion tail (not fitted)",
+            )
+        ax.scatter(Z.real, -Z.imag, color="darkblue", s=10)
+
+        fit = None
+        resistance_entry = None
+        # Each point gives two residuals (real and imaginary).
+        enough_points = 2 * len(f) > n_params + 4
+        if enough_points:
+            try:
+                fit = fit_ecm_spectrum(f, Z, circuit_label, previous)
+            except RuntimeError:
+                fit = None
+        if fit is None:
+            note = "too few points" if not enough_points else "fit failed"
+            summary.update(
+                {"R_bulk": np.nan, "R_i": np.nan, "R_total": np.nan, "Fit error (%)": np.nan}
+            )
+            info.update({"Fit error (%)": np.nan, "Fit note": note})
+            ax.plot([], [], " ", label=note)
+        else:
+            previous = fit["fit_params"]
+            p = fit["params"]
+            se = fit["conf"]
+            r1, r2, q2, n2 = p[:4]
+            if n_arcs == 2:
+                r3, q3, n3 = p[4:7]
+                se_r3 = se[4]
+            else:
+                r3 = q3 = n3 = np.nan
+                se_r3 = 0.0
+            a_w = p[-1] if warburg else np.nan
+            r3_sum = r3 if n_arcs == 2 else 0.0
+            c2 = ecm_effective_capacitance(r2, q2, n2)
+            c3 = ecm_effective_capacitance(r3, q3, n3) if n_arcs == 2 else np.nan
+            bulk_arc = True if direct_bulk else bool(c2 < bulk_c_threshold)
+            # The standard errors use the same formula as impedance.py.
+            if bulk_arc:
+                r_bulk, r_i = r1 + r2, r3_sum
+                se_rb = np.sqrt(se[0] ** 2 + se[1] ** 2)
+                se_ri = se_r3
+            else:
+                r_bulk, r_i = r1, r2 + r3_sum
+                se_rb = se[0]
+                se_ri = np.sqrt(se[1] ** 2 + se_r3**2)
+            r_total = r1 + r2 + r3_sum
+            fit_error = 100 * np.sqrt(
+                np.mean(np.abs(Z - fit["predict"](f)) ** 2 / np.abs(Z) ** 2)
+            )
+
+            notes = list(fit.get("notes", []))
+            if n_arcs == 2:
+                f2 = ecm_arc_frequency(r2, q2, n2)
+                f3 = ecm_arc_frequency(r3, q3, n3)
+                if np.isfinite(f2) and np.isfinite(f3) and f2 / f3 < 10:
+                    notes.append("arcs overlap")
+                if min(r2, r3) < 1e-6 or min(n2, n3) <= 0.31:
+                    notes.append("arc collapsed")
+            elif bulk_arc:
+                notes.append("no interface arc")
+
+            summary.update(
+                {
+                    "R_bulk": r_bulk,
+                    "R_i": r_i,
+                    "R_total": r_total,
+                    "Fit error (%)": fit_error,
+                }
+            )
+            info.update(
+                {
+                    "Fit converged": fit["success"],
+                    "Fit error (%)": fit_error,
+                    "Fit note": ", ".join(notes),
+                }
+            )
+            info.update(fit.get("diagnostics", {}))
+            first = int(direct_bulk)
+            for (name, unit), value, error, start in zip(
+                names[first:], p[first:], se[first:], fit["initial"][first:]
+            ):
+                info[f"{name} ({unit})"] = value
+                info[f"{name} std. error ({unit})"] = error
+                info[f"{name} initial guess ({unit})"] = start
+            info["R_bulk std. error (Ohm)"] = se_rb
+            info["R_i std. error (Ohm)"] = se_ri
+            info["C_eff,bulk (F)" if direct_bulk else "C_eff,2 (F)"] = c2
+            if n_arcs == 2:
+                info["C_eff,interface (F)" if direct_bulk else "C_eff,3 (F)"] = c3
+
+            f_line = np.logspace(np.log10(f.min()), np.log10(f.max()), 500)
+            z_line = fit["predict"](f_line)
+            f_wide = np.logspace(-3, 9, 800)
+            z_arc2 = r1 + ecm_rq_impedance(f_wide, r2, q2, n2)
+            ax.plot(z_arc2.real, -z_arc2.imag, "--", color="gray", lw=1)
+            if n_arcs == 2:
+                z_arc3 = r1 + r2 + ecm_rq_impedance(f_wide, r3, q3, n3)
+                ax.plot(z_arc3.real, -z_arc3.imag, "--", color="gray", lw=1)
+            if warburg:
+                omega = 2 * np.pi * f_line
+                z_w = r_total + a_w * (1 - 1j) / np.sqrt(omega)
+                ax.plot(z_w.real, -z_w.imag, ":", color="gray", lw=1)
+
+            unit_text = {
+                "Ohm": "Ω",
+                "Ohm^-1 s^n": r"$\Omega^{-1}\,s^{n}$",
+                "-": "",
+                "Ohm s^-1/2": r"$\Omega\,s^{-1/2}$",
+            }
+            lines = [
+                f"{name} = {value:.4g} {unit_text[unit]}".rstrip()
+                for (name, unit), value in zip(names[first:], p[first:])
+            ]
+            lines.append(f"Fit error = {fit_error:.2f}%")
+            ax.plot(z_line.real, -z_line.imag, "r-", label="\n".join(lines))
+            if not direct_bulk:
+                (resistance_entry,) = ax.plot(
+                    [], [], " ",
+                    label=f"$R_{{bulk}}$ = {r_bulk:.4g} Ω\n$R_i$ = {r_i:.4g} Ω",
+                )
+
+        x_min, x_max = x_all.min(), x_all.max()
+        y_max = max(y_all.max(), 0)
+        pad = 0.05 * max(x_max - x_min, y_max, 1e-6)
+        ax.set_xlim(x_min - pad, x_max + pad)
+        ax.set_ylim(min(y_all.min(), 0) - pad, y_max + pad)
+        ax.set_title(
+            cycle_title
+            if cycle_title is not None
+            else f"{cell_label} {run_label} Cycle {int(c)}"
+        )
+        ax.set_xlabel("Re(Z)/Ohm")
+        ax.set_ylabel("-Im(Z)/Ohm")
+        ax.set_aspect("equal")
+        # Show R_bulk and R_i first, directly below the circuit string.
+        handles, labels = ax.get_legend_handles_labels()
+        if resistance_entry is not None:
+            first = handles.index(resistance_entry)
+            handles.insert(0, handles.pop(first))
+            labels.insert(0, labels.pop(first))
+        ax.legend(
+            handles,
+            labels,
+            loc="upper left",
+            bbox_to_anchor=(1.05, 1),
+            title=f"ECM: {circuit_text}",
+            fontsize="small",
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
+        plt.close(fig)
+        summary_rows.append(summary)
+        param_rows.append(info)
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(by="Cycle")
+    params_df = pd.DataFrame(param_rows).sort_values(by="Cycle")
+    sum_buf, _ = plot_resistance_trend(summary_df, cell_label, run_label)
+    csv_buf = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    return summary_df, params_df, sum_buf, csv_buf, cycle_images
+
+
+def plot_cp_ewe(
+    f_obj: IO[bytes], cell_label: str, density: float
+) -> tuple[io.BytesIO, pd.DataFrame]:
+    """Plot cell voltage against time for one CP file.
+
+    Args:
+        f_obj: An MPR file object that contains CP data.
+        cell_label: The label of the cell under test.
+        density: The applied current density, in mA/cm².
+
+    Returns:
+        A PNG image buffer of the plot, and the dataframe with a
+        normalized time column in hours.
+    """
+    f_obj.seek(0)
+    mpr = BioLogic.MPRfile(f_obj)
+    df = pd.DataFrame(mpr.data)
+    time_s = df["time/s"] - df["time/s"].iloc[0]
+    time_h = time_s / 3600
+    ewe = df["Ewe/V"]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(time_h, ewe, color="teal")
+    ax.set_title(f"{cell_label}: {density:.3f} mA/cm²")
+    ax.set_xlabel("Time (h)")
+    ax.set_ylabel("Ewe (V)")
+    ax.grid(True, linestyle=":", alpha=0.6)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    df_norm = df.copy()
+    df_norm["norm_time_h"] = time_h
+    return buf, df_norm
+
+
+def impedance_fit(
+    settings: dict[str, Any],
+    cell_type: str,
+    cell_label: str,
+    data_filename: IO[bytes],
+    run_label: str,
+    cycle_title: Optional[str] = None,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> tuple[
+    pd.DataFrame,
+    Optional[pd.DataFrame],
+    io.BytesIO,
+    io.StringIO,
+    list[tuple[str, io.BytesIO]],
+]:
+    """Fit each PEIS cycle with the technique in the settings.
+
+    Call ecm_fit for "ECM fit". Call semiellipse_fit for the other
+    techniques.
+
+    Args:
+        settings: The fit settings. The keys are "technique",
+            "discard_left", "discard_right", "fit_choice",
+            "ecm_circuit", "ecm_remove_tail", and "bulk_c_threshold".
+        cell_type: The type of analysis, for example "Preconditioning".
+        cell_label: The label of the cell under test.
+        data_filename: An MPR file object that contains PEIS data.
+        run_label: The label for this run, for example "Positive".
+        cycle_title: The title for each cycle plot. If None, use the
+            cell label, the run label, and the cycle number.
+        progress: A function that the fit calls before each cycle. See
+            ecm_fit.
+
+    Returns:
+        A tuple with the summary dataframe, the fit parameter dataframe
+        (None for the semi-ellipse fit), the trend plot buffer, the
+        summary CSV buffer, and a list of (file name, image buffer)
+        pairs for each cycle. See ecm_fit. The summary CSV has units in
+        the column names.
+    """
+    if settings["technique"] == "ECM fit":
+        return ecm_fit(
+            cell_type,
+            cell_label,
+            data_filename,
+            run_label,
+            settings["ecm_circuit"],
+            settings["bulk_c_threshold"],
+            remove_tail=bool(settings.get("ecm_remove_tail", True)),
+            cycle_title=cycle_title,
+            progress=progress,
+        )
+    summary_df, sum_buf, csv_buf, cycle_imgs = semiellipse_fit(
+        cell_type,
+        cell_label,
+        settings["discard_left"],
+        settings["discard_right"],
+        data_filename,
+        run_label,
+        settings["fit_choice"] == "Two Ellipse (Recommended)",
+        settings["fit_choice"] == "Single Ellipse",
+        cycle_title=cycle_title,
+        progress=progress,
+    )
+    # Write the summary CSV with units in the column names.
+    csv_buf = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    return summary_df, None, sum_buf, csv_buf, cycle_imgs
+
+
+def plot_limiting_peis_fit(
+    f_peis: IO[bytes],
+    cell_label: str,
+    run_label: str,
+    settings: dict[str, Any],
+    density: Optional[float] = None,
+) -> tuple[Optional[io.BytesIO], pd.DataFrame, Optional[pd.DataFrame], io.StringIO]:
+    """Fit the PEIS data for one Limiting Current run.
+
+    Call impedance_fit and return the first cycle image.
+
+    Args:
+        f_peis: An MPR file object that contains PEIS data.
+        cell_label: The label of the cell under test.
+        run_label: The label for this run, for example "Run 1".
+        settings: The fit settings. See impedance_fit.
+        density: The applied current density, in mA/cm². Show it in the
+            plot title in place of the run label and the cycle number.
+
+    Returns:
+        The first cycle image buffer, or None if no cycle exists. Also
+        return the summary dataframe, the fit parameter dataframe (None
+        for the semi-ellipse fit), and the summary CSV buffer.
+    """
+    summary_df, params_df, sum_buf, csv_buf, cycle_imgs = impedance_fit(
+        settings,
+        "Limiting",
+        cell_label,
+        f_peis,
+        run_label,
+        cycle_title=(
+            None
+            if density is None
+            else f"{cell_label}: {abs(density):.3f} mA/cm²"
+        ),
+    )
+    if cycle_imgs:
+        return cycle_imgs[0][1], summary_df, params_df, csv_buf
+    return None, summary_df, params_df, csv_buf
+
+
+def is_diverging(
+    time_s: np.ndarray,
+    v_abs: np.ndarray,
+    smooth_frac: float = 0.12,
+    rise_frac: float = 0.5,
+    early_frac: float = 0.1,
+    min_span_v: float = 1e-3,
+) -> bool:
+    """Tell whether a voltage profile diverges.
+
+    A profile that does not diverge rises, and its slope then falls
+    toward zero. The curve stays concave down, so the slope has one
+    peak, at the start. A profile that diverges rises, slows to a
+    shoulder, and then rises faster again. Its slope falls to a minimum
+    and then recovers, so the slope has a second peak. This function
+    counts the peaks.
+
+    Resample the voltage onto a uniform time grid. Smooth it and take
+    its slope with a Savitzky-Golay filter. Scale the slope by the mean
+    slope of the whole run (the total voltage change divided by the run
+    time). This is the same as scaling the voltage change and the run
+    time to 1. Then the size of a peak does not depend on the units,
+    the run time, the voltage offset, or the sharp start of the run.
+    Count the peaks of the slope, including a peak at the start and a
+    peak at the end. Ignore a peak that is smaller than rise_frac. Also
+    ignore a peak in the first early_frac of the run, because the
+    initial transient has more than one slope peak.
+
+    Args:
+        time_s: The time values, in seconds. They must not decrease.
+        v_abs: The absolute cell voltage at each time value.
+        smooth_frac: The filter window, as a fraction of the 2000
+            resampled points.
+        rise_frac: The smallest peak that counts, in units of the mean
+            slope of the run. A slow creep after the shoulder is
+            smaller than this and does not count.
+        early_frac: The fraction of the run, from the start, in which a
+            slope peak does not count.
+        min_span_v: The smallest voltage change that the test accepts,
+            in V. A profile that changes less than this does not
+            diverge. This guard uses the real voltage, so apply it
+            before any scaling.
+
+    Returns:
+        True if the profile diverges. False if it does not diverge, or
+        if the run has too few points to test.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    v_abs = np.asarray(v_abs, dtype=float)
+    if len(time_s) < 50 or time_s[-1] <= time_s[0]:
+        return False
+
+    n_grid = 2000
+    t = np.linspace(time_s[0], time_s[-1], n_grid)
+    v = np.interp(t, time_s, v_abs)
+    if np.ptp(v) < min_span_v:
+        return False
+
+    window = int(smooth_frac * n_grid) | 1  # the window must be odd
+    dv = savgol_filter(v, window, 3, deriv=1, delta=t[1] - t[0])
+
+    # The filter is least reliable at the end of the run, so drop the
+    # last half window. Keep the start. It holds the initial peak.
+    dv = dv[: n_grid - window // 2]
+
+    # Scale the slope by the mean slope of the run.
+    dv = dv / (np.ptp(v) / (t[-1] - t[0]))
+
+    # Pad both ends with a low value, so that find_peaks can count a
+    # peak at the first point and at the last point.
+    pad = dv.min() - np.ptp(dv)
+    padded = np.concatenate([[pad], dv, [pad]])
+    peaks, _ = find_peaks(padded, prominence=rise_frac)
+
+    # Index 0 of the padded signal is the pad. Index 1 is the start.
+    positions = (peaks - 1) / n_grid
+    counted = [p for p in positions if p <= 0 or p >= early_frac]
+    return bool(len(counted) >= 2)
+
+
+def analyze_sand_and_polarization(
+    cp_results: list[tuple[pd.DataFrame, float]],
+    auto_detect_plateau: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Find the Sand's time and the steady-state polarization for each run.
+
+    Find the highest voltage across all runs. For each run that reaches
+    near this ceiling, record the time it first crosses 99% of the peak
+    voltage. For each run that does not diverge (see is_diverging),
+    record the mean voltage over the last two minutes.
+
+    Args:
+        cp_results: A list of (dataframe, current density) pairs.
+        auto_detect_plateau: If True, record the steady-state voltage only
+            for the runs that do not diverge. If False, record it for all runs.
+
+    Returns:
+        A dataframe of Sand's times and a dataframe of steady-state
+        voltages.
+    """
+    sands = []
+    pols = []
+
+    v_max_list = []
+
+    for df, density in cp_results:
+        v_abs = df["Ewe/V"].abs()
+        v_max_this_run = v_abs.max()
+        v_max_list.append(v_max_this_run)
+
+    ceiling_voltage = max(v_max_list)
+
+    for df, density in cp_results:
+        v_abs = df["Ewe/V"].abs()
+        v_max = v_abs.max()
+        if (
+            v_max >= 0.99 * ceiling_voltage
+        ):  # i.e. diverged and fully reached ceiling voltage
+            idx_list = df[v_abs >= (v_max * 0.99)].index
+            if not idx_list.empty:
+                idx = idx_list[0]
+                t_sand = df.loc[idx, "norm_time_h"]
+                sands.append(
+                    {
+                        "Current (mA/cm^2)": round(abs(density), 3),
+                        "Sand's Time (h)": t_sand,
+                    }
+                )
+        t_end_s = df["norm_time_h"].iloc[-1] * 3600
+        df_final = df[(df["norm_time_h"] * 3600) >= (t_end_s - 120)]
+
+        if not df_final.empty and not (
+            auto_detect_plateau
+            and is_diverging(
+                (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+            )
+        ):
+            v_avg = df_final["Ewe/V"].mean()
+            pols.append(
+                {
+                    "Current (mA/cm^2)": round(density, 3),
+                    "Steady State Voltage (V)": v_avg,
+                }
+            )
+    return pd.DataFrame(sands), pd.DataFrame(pols)
+
+
+def diffusion_exp_model(
+    t: np.ndarray, a: float, b: float, k0: float
+) -> np.ndarray:
+    """Compute the exponential relaxation model at time t.
+
+    Args:
+        t: The time values, in seconds.
+        a: The amplitude of the decay.
+        b: The decay rate constant.
+        k0: The steady-state offset voltage.
+
+    Returns:
+        The modeled voltage at each time value.
+    """
+    return k0 + a * np.exp(-b * t)
+
+
+def analyze_diffusion_coefficient(
+    files: list[IO[bytes]],
+    thickness_cm: float,
+    cutoff_time_s: float,
+    alpha: float = 0.05,
+) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, io.BytesIO]:
+    """Fit OCV relaxation data and calculate the diffusion coefficient.
+
+    For each file, fit the model V(t) = a exp(-b t) + k0. Advance the
+    fit start time until it passes the minimum time for the chosen
+    alpha. Calculate D from the decay rate and the sample thickness.
+    Plot the fit and the log relaxation magnitude for each file.
+
+    Args:
+        files: A list of MPR file objects that contain OCV relaxation
+            data.
+        thickness_cm: The sample thickness, in cm.
+        cutoff_time_s: The latest time to include in the fit, in
+            seconds.
+        alpha: The target value of D t / L² at the fit start time.
+
+    Returns:
+        A tuple with the results dataframe, the fit curve dataframe,
+        the OCV fit plot buffer, and the log relaxation plot buffer.
+
+    Raises:
+        ValueError: The thickness, cutoff time, or alpha is not
+            positive. A file has too little data, or the fit fails.
+    """
+    if thickness_cm <= 0:
+        raise ValueError("Thickness must be greater than 0 cm.")
+    if cutoff_time_s <= 0:
+        raise ValueError("Cutoff time must be greater than 0 seconds.")
+    if alpha <= 0:
+        raise ValueError("Alpha must be greater than 0.")
+
+    results = []
+    fit_exports = []
+    fig_original, ax_original = plt.subplots(figsize=(9, 5))
+    fig_log, ax_log = plt.subplots(figsize=(9, 5))
+
+    for file_obj in files:
+        file_obj.seek(0)
+        mpr = BioLogic.MPRfile(file_obj)
+        df_raw = pd.DataFrame(mpr.data)
+
+        time_col = find_cf_mpr_column(df_raw, ["time/s", "time"], "time")
+        voltage_col = find_cf_mpr_column(
+            df_raw, ["Ewe/V", "Ewe", "voltage", "potential"], "voltage"
+        )
+
+        df = pd.DataFrame(
+            {
+                "time_s": pd.to_numeric(df_raw[time_col], errors="coerce"),
+                "potential_mV": pd.to_numeric(df_raw[voltage_col], errors="coerce")
+                * 1000,
+            }
+        ).dropna()
+
+        if df.empty:
+            raise ValueError(f"{file_obj.name} has no numeric OCV relaxation data.")
+
+        df["time_s"] = df["time_s"] - df["time_s"].iloc[0]
+        total_time_h = df["time_s"].max() / 3600
+        df = df[df["time_s"] <= cutoff_time_s].reset_index(drop=True)
+        if len(df) < 6:
+            raise ValueError(
+                f"{file_obj.name} has fewer than 6 points before the cutoff time."
+            )
+
+        t = df["time_s"].to_numpy(dtype=float)
+        ewe = df["potential_mV"].to_numpy(dtype=float)
+        dt = np.median(np.diff(t)) if len(t) > 1 else 5.0
+        if not np.isfinite(dt) or dt <= 0:
+            dt = 5.0
+
+        a_guess = ewe[0] - ewe[-1]
+        if abs(a_guess) < 1e-12:
+            a_guess = 1.0
+        initial = [a_guess, 5e-4, ewe[-1]]
+
+        start_idx = 0
+        coeff = None
+        diffusion = np.nan
+        alpha_final = np.nan
+        t_min_s = np.nan
+
+        for _ in range(25):
+            t_fit = t[start_idx:] - t[start_idx]
+            ewe_fit = ewe[start_idx:]
+            if len(t_fit) < 5:
+                raise ValueError(
+                    f"{file_obj.name} does not have enough data after the alpha cutoff."
+                )
+
+            coeff, _ = curve_fit(
+                diffusion_exp_model,
+                t_fit,
+                ewe_fit,
+                p0=initial,
+                maxfev=20000,
+            )
+            b = coeff[1]
+            if b <= 0:
+                raise ValueError(
+                    f"{file_obj.name} fit produced a non-positive decay constant."
+                )
+
+            diffusion = thickness_cm**2 * b / np.pi**2
+            t_min_s = alpha * thickness_cm**2 / diffusion
+            alpha_final = diffusion * t[start_idx] / thickness_cm**2
+
+            if t[start_idx] > t_min_s:
+                break
+
+            next_start_time = t_min_s + 5 * dt
+            next_idx = int(np.searchsorted(t, next_start_time, side="left"))
+            if next_idx <= start_idx or next_idx >= len(t) - 5:
+                break
+            start_idx = next_idx
+            initial = coeff
+
+        fit_x = np.linspace(0, t[-1] - t[start_idx], 1000)
+        fit_y = diffusion_exp_model(fit_x, *coeff)
+        fit_time_abs = fit_x + t[start_idx]
+
+        ax_original.plot(t, ewe, ".", markersize=3, label=f"{file_obj.name} data")
+        ax_original.plot(fit_time_abs, fit_y, "-", linewidth=2, label=f"{file_obj.name} fit")
+        voltage_relax_mV = np.abs(ewe - coeff[2])
+        fit_relax_mV = np.abs(fit_y - coeff[2])
+        positive_mask = voltage_relax_mV > 0
+        fit_positive_mask = fit_relax_mV > 0
+        if np.any(positive_mask):
+            ax_log.plot(
+                t[positive_mask],
+                np.log(voltage_relax_mV[positive_mask]),
+                ".",
+                markersize=3,
+                label=f"{file_obj.name} data",
+            )
+        if np.any(fit_positive_mask):
+            ax_log.plot(
+                fit_time_abs[fit_positive_mask],
+                np.log(fit_relax_mV[fit_positive_mask]),
+                "-",
+                linewidth=2,
+                label=f"{file_obj.name} fit",
+            )
+
+        results.append(
+            {
+                "File Name": file_obj.name,
+                "D_salt (cm^2/s)": f"{diffusion:.4e}",
+                "alpha = D_salt t / L^2": alpha_final,
+                "Total Time (h)": total_time_h,
+                "Fit Start Time (s)": t[start_idx],
+                "Minimum Time (s)": t_min_s,
+                "Cutoff Time (h)": cutoff_time_s / 3600,
+                "Thickness (um)": thickness_cm / 1e-4,
+                "a (mV)": coeff[0],
+                "b (1/s)": coeff[1],
+                "k0 (mV)": coeff[2],
+            }
+        )
+
+        fit_exports.append(
+            pd.DataFrame(
+                {
+                    "File Name": file_obj.name,
+                    "Fit Time (s)": fit_time_abs,
+                    "Fit Potential (mV)": fit_y,
+                }
+            )
+        )
+
+    ax_original.set_title("OCV Relaxation Fit: U(t) = k0 + a exp(-bt)")
+    ax_original.set_xlabel("Time (s)")
+    ax_original.set_ylabel("Potential (mV)")
+    ax_original.grid(True, alpha=0.3)
+    ax_original.legend(loc="best", fontsize="small")
+
+    ax_log.set_title("Log Relaxation Magnitude Fit")
+    ax_log.set_xlabel("Time (s)")
+    ax_log.set_ylabel("log(|U(t) - k0| / mV)")
+    ax_log.grid(True, alpha=0.3)
+    ax_log.legend(loc="best", fontsize="small")
+
+    original_buf = io.BytesIO()
+    fig_original.savefig(original_buf, format="png", dpi=300, bbox_inches="tight")
+    original_buf.seek(0)
+
+    log_buf = io.BytesIO()
+    fig_log.savefig(log_buf, format="png", dpi=300, bbox_inches="tight")
+    log_buf.seek(0)
+
+    results_df = pd.DataFrame(results)
+    fit_df = pd.concat(fit_exports, ignore_index=True) if fit_exports else pd.DataFrame()
+    plt.close(fig_original)
+    plt.close(fig_log)
+    return results_df, fit_df, original_buf, log_buf
+
+
+def _cf_file_type(name: str) -> Optional[str]:
+    """Classify a Current Fraction file as OCV or CA from its name.
+
+    Check for "OCV" first, then "CA", as a substring of the file
+    name.
+
+    Args:
+        name: The file name to classify.
+
+    Returns:
+        "OCV" if the name contains "OCV". "CA" if the name contains
+        "CA" and not "OCV". None if neither pattern matches.
+    """
+    name_upper = name.upper()
+    if "OCV" in name_upper:
+        return "OCV"
+    if "CA" in name_upper:
+        return "CA"
+    return None
+
+
+def _cf_short_label(name: str) -> str:
+    """Get a short label for a Current Fraction file, for titles.
+
+    Use the numbering-convention token in the file name if it matches
+    the pattern "_<digits>_<letters>_C<digits>" at the end (the usual
+    numbering convention, for example "03" from "..._03_OCV_C01.mpr").
+    Otherwise, use the file name without its extension.
+
+    Args:
+        name: The file name to label.
+
+    Returns:
+        The short label.
+    """
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+
+    pattern = re.compile(r"_(\d+)_[A-Za-z]+_C\d+$")
+    match = pattern.search(stem)
+    return match.group(1) if match else stem
+
+
+def build_cf_file_pairs(files: list[IO[bytes]]) -> list[dict[str, Any]]:
+    """Group Current Fraction files into a positive and negative trial.
+
+    Classify each file as OCV or CA from its name, in upload order.
+    Discard the first OCV file found; it is a leading rest step, not
+    part of a trial. Treat the next OCV as a trial's OCV file, and
+    collect every CA file that immediately follows it as that trial's
+    CA chain, so a chain can hold one CA file or several. Discard the
+    OCV that starts the next leading rest step, then repeat to find
+    the second trial's OCV and CA chain. Stop once two trials are
+    found, since Current Fraction expects exactly one positive and one
+    negative trial.
+
+    Args:
+        files: A list of CA and OCV MPR file objects, in upload order.
+
+    Returns:
+        A list of up to two trial dictionaries, one for each complete
+        OCV + CA chain found.
+    """
+    typed_files = [(f, _cf_file_type(f.name)) for f in files]
+    typed_files = [(f, t) for f, t in typed_files if t is not None]
+
+    labels = [("R_pos", "Positive"), ("R_neg", "Negative")]
+    pairs = []
+    ocv_count = 0
+    i = 0
+    n = len(typed_files)
+
+    while i < n and len(pairs) < 2:
+        f, t = typed_files[i]
+        if t != "OCV":
+            i += 1
+            continue
+        ocv_count += 1
+        i += 1
+        if ocv_count % 2 == 1:
+            # Odd-numbered OCV: a leading rest step. Discard it.
+            continue
+        # Even-numbered OCV: the trial's OCV file. Collect its CA chain.
+        ocv_file = f
+        ca_files = []
+        while i < n and typed_files[i][1] == "CA":
+            ca_files.append(typed_files[i][0])
+            i += 1
+        if not ca_files:
+            continue
+        resistance_key, run_label = labels[len(pairs)]
+        title = f"{_cf_short_label(ocv_file.name)} OCV + " + " + ".join(
+            f"{_cf_short_label(c.name)} CA" for c in ca_files
+        )
+        pairs.append(
+            {
+                "ocv_file": ocv_file,
+                "ca_files": ca_files,
+                "experiment": run_label,
+                "resistance_key": resistance_key,
+                "description": title,
+            }
+        )
+    return pairs
+
+
+def read_cf_mpr_file(file_obj: IO[bytes]) -> pd.DataFrame:
+    """Read an MPR file into a dataframe.
+
+    Args:
+        file_obj: An MPR file object.
+
+    Returns:
+        A dataframe with the raw MPR data.
+    """
+    file_obj.seek(0)
+    mpr = BioLogic.MPRfile(file_obj)
+    return pd.DataFrame(mpr.data)
+
+
+def find_cf_mpr_column(
+    df: pd.DataFrame, candidates: list[str], required_label: str
+) -> str:
+    """Find a column name in a dataframe from a list of candidates.
+
+    Match column names by exact text first. Then match column names
+    that contain a candidate as a substring.
+
+    Args:
+        df: The dataframe to search.
+        candidates: A list of candidate column names.
+        required_label: A label for the error message if no match
+            exists.
+
+    Returns:
+        The matching column name.
+
+    Raises:
+        ValueError: No column matches any candidate.
+    """
+    lower_to_col = {str(col).lower().strip(): col for col in df.columns}
+    for candidate in candidates:
+        if candidate.lower() in lower_to_col:
+            return lower_to_col[candidate.lower()]
+
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+        if any(candidate.lower() in col_lower for candidate in candidates):
+            return col
+
+    raise ValueError(f"Missing {required_label} column")
+
+
+def _read_cf_ca_chain(ca_files: list[IO[bytes]]) -> pd.DataFrame:
+    """Read and concatenate a chain of CA files into one timeline.
+
+    Read each CA file's time, current, and voltage data. Zero-base
+    each file's time to its own first point, then offset it to
+    continue from where the previous file in the chain left off, so
+    the chain reads as one continuous run.
+
+    Args:
+        ca_files: The CA MPR file objects in the chain, in order.
+
+    Returns:
+        A dataframe with continuous "time", "current", "voltage", and
+        "ca_file" columns, one row per data point across the chain.
+    """
+    segments = []
+    time_offset = 0.0
+    for ca_file in ca_files:
+        ca_data = read_cf_mpr_file(ca_file)
+        ca_time_col = find_cf_mpr_column(ca_data, ["time/s", "time"], "CA time")
+        ca_voltage_col = find_cf_mpr_column(
+            ca_data, ["Ewe/V", "Ewe", "voltage", "potential"], "CA voltage"
+        )
+        ca_current_col = find_cf_mpr_column(
+            ca_data, ["I/mA", "<I>/mA", "current"], "CA current"
+        )
+        seg = pd.DataFrame(
+            {
+                "time": pd.to_numeric(ca_data[ca_time_col], errors="coerce"),
+                "current": pd.to_numeric(ca_data[ca_current_col], errors="coerce"),
+                "voltage": pd.to_numeric(ca_data[ca_voltage_col], errors="coerce")
+                * 1000,
+            }
+        ).dropna()
+        if seg.empty:
+            continue
+        seg["time"] = seg["time"] - seg["time"].iloc[0] + time_offset
+        time_offset = seg["time"].iloc[-1]
+        seg["ca_file"] = ca_file.name
+        segments.append(seg)
+    return (
+        pd.concat(segments, ignore_index=True) if segments else pd.DataFrame()
+    )
+
+
+def current_fraction_transient_model(
+    t: np.ndarray,
+    i_ss: float,
+    tau: float,
+    slope: float,
+    t0: float,
+    i_omega: float,
+) -> np.ndarray:
+    """Model Na-Sn current relaxation, constrained by the theoretical i_omega."""
+    return (
+        i_ss
+        + (i_omega - i_ss) * np.exp(-(t + t0) / tau)
+        + slope * t
+    )
+
+
+def fit_current_fraction_iss_transient(
+    ca_clean: pd.DataFrame, tail_n: int, i_omega: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit steady-state current for Na-Sn alloy current-fraction data.
+
+    Use the transient-only algorithm. Fit a linear decay to the late
+    data, subtract it from the early data, then fit the transient
+    model to the early data. i_omega is the calculated theoretical
+    current, not a measured value.
+    """
+    t_fit = ca_clean["time"].to_numpy(dtype=float)
+    i_fit = ca_clean["current"].to_numpy(dtype=float)
+    t_fit = t_fit - t_fit[0]
+
+    if len(t_fit) < 8:
+        raise ValueError("Transient fit requires at least 8 CA points.")
+
+    t_range = max(t_fit[-1] - t_fit[0], 1.0)
+    midpoint_idx = max(len(t_fit) // 2, 3)
+    t_late = t_fit[midpoint_idx:]
+    i_late_raw = i_fit[midpoint_idx:]  # spliced from the original current data
+    t_late_centered = t_late - t_late[0]
+    # Deterministic linear regression, not an optimizer starting value
+    slope_fit = (
+        np.polyfit(t_late_centered, i_late_raw, 1)[0]
+        if len(t_late_centered) > 2
+        else 0.0
+    )
+
+    i_corrected = i_fit - slope_fit * t_fit
+    i_ss_guess = np.mean(i_corrected[-tail_n:])
+    t_early = t_fit[:midpoint_idx]
+    # Spliced from current data with the linear decay (slope_fit * t) subtracted
+    i_early_detrended = i_corrected[:midpoint_idx]
+    tau_guess = max((t_early[-1] - t_early[0]) / 3, 1.0)
+
+    if i_omega != i_ss_guess and i_early_detrended[0] != i_ss_guess:
+        ratio = (i_early_detrended[0] - i_ss_guess) / (i_omega - i_ss_guess)
+        t0_guess = max(-tau_guess * np.log(ratio), 0.0) if ratio > 0 else 0.0
+    else:
+        t0_guess = 0.0
+    t0_guess = min(t0_guess, t_range)
+
+    coeff, _ = curve_fit(
+        lambda t, i_ss, tau, t0: current_fraction_transient_model(
+            t, i_ss, tau, 0.0, t0, i_omega
+        ),
+        t_early,
+        i_early_detrended,
+        p0=[i_ss_guess, tau_guess, t0_guess],
+        bounds=([-np.inf, 1e-9, 0.0], [np.inf, np.inf, t_range * 5]),
+        maxfev=20000,
+    )
+    i_ss, tau, t0 = coeff
+    amplitude = i_omega - i_ss
+    fit_curve = current_fraction_transient_model(
+        t_fit, i_ss, tau, slope_fit, t0, i_omega
+    )
+    return np.array([i_ss, amplitude, tau, slope_fit, t0]), t_fit, fit_curve
+
+
+def analyze_current_fraction_mpr(
+    files: list[IO[bytes]],
+    resistances: dict[str, list[float]],
+    average_points: int = 5000,
+    iss_method: str = "Tail average",
+) -> tuple[pd.DataFrame, pd.DataFrame, io.BytesIO, float]:
+    """Calculate the current fraction rho+ for each trial.
+
+    For each trial, read the OCV data and the trial's chained CA
+    files. Calculate the initial current from the first CA file, the
+    steady-state current from the CA chain, and the migration current.
+    Calculate rho+ from these currents and the fitted resistances.
+    Plot the CA chain with current markers for each trial, with a
+    dotted line at each join between CA files.
+
+    Args:
+        files: A list of CA and OCV MPR file objects, in upload order.
+        resistances: A dictionary that maps each resistance key to a
+            list of R_bulk and R_i values.
+        average_points: The number of points from the end of each
+            trial's CA chain to average.
+        iss_method: Use tail averaging or the Na-Sn transient-fit model
+            to determine steady-state current.
+
+    Returns:
+        A tuple with the summary dataframe, the per-trial results
+        dataframe, the combined plot buffer, and the average rho+
+        value.
+
+    Raises:
+        ValueError: No valid trials exist, or a trial has no numeric
+            data.
+    """
+    file_pairs = build_cf_file_pairs(files)
+    if not file_pairs:
+        raise ValueError(
+            "No valid OCV + CA trials found. Upload a leading rest OCV, "
+            "a trial OCV, and one or more CA files for each of the two "
+            "trials."
+        )
+
+    fig, axes = plt.subplots(len(file_pairs), 1, figsize=(12, 6 * len(file_pairs)))
+    if len(file_pairs) == 1:
+        axes = [axes]
+    fig.suptitle("CA Curves with Current Markers", fontsize=16)
+
+    results = []
+    rho_values = []
+
+    for idx, pair in enumerate(file_pairs):
+        ocv_data = read_cf_mpr_file(pair["ocv_file"])
+        ocv_voltage_col = find_cf_mpr_column(
+            ocv_data, ["Ewe/V", "Ewe", "voltage", "potential"], "OCV voltage"
+        )
+        ocv_voltage = pd.to_numeric(ocv_data[ocv_voltage_col], errors="coerce") * 1000
+        ocv_voltage = ocv_voltage.dropna()
+
+        ca_clean = _read_cf_ca_chain(pair["ca_files"])
+
+        if ca_clean.empty or ocv_voltage.empty:
+            raise ValueError(
+                f"{pair['experiment']} trial ({pair['description']}) has no "
+                "numeric CA/OCV data."
+            )
+
+        tail_n = min(int(average_points), len(ca_clean), len(ocv_voltage))
+        if tail_n < 1:
+            raise ValueError("Average points must be at least 1.")
+
+        i_first = ca_clean["current"].iloc[:10]
+        i_o = i_first.loc[i_first.abs().idxmax()]  # largest magnitude, keeps sign
+        delV = ca_clean["voltage"].iloc[-tail_n:].mean()
+        OCV = ocv_voltage.iloc[-tail_n:].mean()
+
+        Rbulk_o, R_i_o, Rbulk_ss, R_i_ss = resistances[pair["resistance_key"]]
+        delV_prime = delV - OCV
+        i_omega = delV_prime / (Rbulk_o + R_i_o)
+
+        iss_fit_amplitude = np.nan
+        iss_fit_tau = np.nan
+        iss_fit_slope = np.nan
+        iss_fit_t0 = np.nan
+        iss_fit_curve = None
+        iss_fit_time = None
+        if iss_method.startswith("Transient fit"):
+            coeff, t_fit, iss_fit_curve = fit_current_fraction_iss_transient(
+                ca_clean, tail_n, i_omega
+            )
+            (
+                i_ss,
+                iss_fit_amplitude,
+                iss_fit_tau,
+                iss_fit_slope,
+                iss_fit_t0,
+            ) = coeff
+            iss_fit_time = ca_clean["time"].iloc[0] + t_fit
+        else:
+            i_ss = ca_clean["current"].iloc[-tail_n:].mean()
+
+        rho_add = (i_ss / i_omega) * (
+            (delV_prime - i_omega * R_i_o) / (delV_prime - i_ss * R_i_ss)
+        )
+        rho_values.append(rho_add)
+
+        ax = axes[idx]
+        ax.scatter(ca_clean["time"], ca_clean["current"], s=1, alpha=0.6, c="blue", label="CA curve")
+        join_mask = ca_clean["ca_file"] != ca_clean["ca_file"].shift(1)
+        join_times = ca_clean.loc[join_mask, "time"].iloc[1:]
+        for j, join_time in enumerate(join_times):
+            ax.axvline(
+                x=join_time,
+                color="gray",
+                linestyle=":",
+                alpha=0.6,
+                label="CA file join" if j == 0 else None,
+            )
+        ax.axhline(y=i_o, color="red", linestyle="--", alpha=0.8, linewidth=2, label=f"I,o = {i_o:.3f} mA")
+        ax.axhline(y=i_ss, color="green", linestyle="--", alpha=0.8, linewidth=2, label=f"I,ss = {i_ss:.3f} mA")
+        ax.axhline(y=i_omega, color="orange", linestyle="--", alpha=0.8, linewidth=2, label=f"I,omega = {i_omega:.3f} mA")
+        if iss_fit_curve is not None:
+            ax.plot(
+                iss_fit_time,
+                iss_fit_curve,
+                color="black",
+                linewidth=1.5,
+                label="Na-Sn transient fit",
+            )
+        else:
+            ax.axvspan(
+                ca_clean["time"].iloc[-tail_n],
+                ca_clean["time"].iloc[-1],
+                alpha=0.2,
+                color="green",
+                label=f"SS region (last {tail_n} points)",
+            )
+        ax.set_xlabel("Time (seconds)")
+        ax.set_ylabel("Current (mA)")
+        ax.set_title(f"{pair['experiment']}: {pair['description']}")
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        results.append(
+            {
+                "experiment": pair["experiment"],
+                "description": pair["description"],
+                "i_o": i_o,
+                "i_ss": i_ss,
+                "i_omega": i_omega,
+                "delV": delV,
+                "OCV": OCV,
+                "delV_prime": delV_prime,
+                "rho_add": rho_add,
+                "resistance_type": pair["resistance_key"],
+                "iss_method": iss_method,
+                "iss_fit_amplitude": iss_fit_amplitude,
+                "iss_fit_tau": iss_fit_tau,
+                "iss_fit_slope": iss_fit_slope,
+                "iss_fit_t0": iss_fit_t0,
+                "ocv_file": pair["ocv_file"].name,
+                "ca_files": ", ".join(c.name for c in pair["ca_files"]),
+            }
+        )
+
+    fig.tight_layout()
+    plot_buf = io.BytesIO()
+    fig.savefig(plot_buf, format="png", dpi=300, bbox_inches="tight")
+    plot_buf.seek(0)
+    plt.close(fig)
+
+    results_df = pd.DataFrame(results)
+    avg_rho = np.mean(rho_values) if rho_values else np.nan
+    summary_row = {
+        "experiment": "AVERAGE",
+        "description": "Average of all experiments",
+        "i_o": np.nan,
+        "i_ss": np.nan,
+        "i_omega": np.nan,
+        "delV": np.nan,
+        "OCV": np.nan,
+        "delV_prime": np.nan,
+        "rho_add": avg_rho,
+        "resistance_type": "",
+        "iss_method": "",
+        "iss_fit_amplitude": np.nan,
+        "iss_fit_tau": np.nan,
+        "iss_fit_slope": np.nan,
+        "iss_fit_t0": np.nan,
+        "ocv_file": "",
+        "ca_files": "",
+    }
+    summary_df = pd.concat([results_df, pd.DataFrame([summary_row])], ignore_index=True)
+    summary_df = summary_df.rename(
+        columns={
+            "experiment": "Experiment",
+            "description": "Description",
+            "i_o": "I,o (mA)",
+            "i_ss": "I,ss (mA)",
+            "i_omega": "I,omega (mA)",
+            "delV": "delV (mV)",
+            "OCV": "OCV (mV)",
+            "delV_prime": "delV' (mV)",
+            "rho_add": "rho+",
+            "resistance_type": "Resistance Type",
+            "iss_method": "I,ss Method",
+            "iss_fit_amplitude": "I,ss Fit Amplitude (mA)",
+            "iss_fit_tau": "I,ss Fit tau (s)",
+            "iss_fit_slope": "I,ss Fit slope (mA/s)",
+            "iss_fit_t0": "I,ss Fit t0 (s)",
+            "ocv_file": "OCV File",
+            "ca_files": "CA Files",
+        }
+    )
+
+    return summary_df, results_df, plot_buf, avg_rho
+
+
+def series100(
+    y: Union[float, np.ndarray], current: Union[float, np.ndarray], i_L: float
+) -> Union[float, np.ndarray]:
+    """Evaluate the Sand's time series expansion.
+
+    Sum 100 terms of the series for each combination of y and current.
+
+    Args:
+        y: One or more values of L² / (D t).
+        current: One or more current density values.
+        i_L: The limiting current density.
+
+    Returns:
+        The series value at each combination of y and current. Return
+        a scalar if both y and current are scalars.
+    """
+    y_arr = np.atleast_1d(y)
+    current_arr = np.atleast_1d(current)
+
+    y_col = y_arr[:, np.newaxis]
+    current_col = current_arr[:, np.newaxis]
+    
+    x = current_col / i_L
+    
+    n = np.arange(1, 101)
+    beta_n = (2 * n - 1) * np.pi
+    
+    matrix_terms = 8 * x / beta_n**2 * (1 - np.exp(-beta_n**2 / y_col))
+    result = np.sum(matrix_terms, axis=1)
+    
+    if np.isscalar(y) and np.isscalar(current):
+        return result[0]
+        
+    return result
+
+
+def solve_sands_fit(
+    sands_df: pd.DataFrame,
+    L: float,
+    D: float,
+    last_stable_i: float,
+    first_div_i: float,
+) -> tuple[float, np.ndarray, list[float]]:
+    """Fit the limiting current from Sand's time data.
+
+    Fit i_L to the Sand's time series model. Compute the theoretical
+    curve near the fitted limiting current.
+
+    Args:
+        sands_df: A dataframe with Sand's time and current density
+            columns.
+        L: The electrolyte thickness, in cm.
+        D: The diffusion coefficient, in cm²/s.
+        last_stable_i: The highest current density that did not
+            diverge.
+        first_div_i: The lowest current density that diverged.
+
+    Returns:
+        A tuple with the fitted limiting current, the theoretical x
+        values, and the theoretical y values.
+    """
+    t_sand_s = sands_df["Sand's Time (h)"].values * 3600
+    current_vals = sands_df["Current (mA/cm^2)"].values
+    y_data = L**2 / (D * t_sand_s)
+
+    def sse(k, y, curr):
+        return np.sum(np.sqrt((series100(y, curr, *k) - 1) ** 2))
+        
+    i_guess = [(last_stable_i + first_div_i) / 2]
+    res = fmin(sse, i_guess, args=(y_data, current_vals), disp=False)
+    i_optimized = res[0]
+
+    def series_root(x):
+        return lambda y_root: series100(y_root, x, 1.0) - 1
+
+    x_right = max(current_vals) / i_optimized if len(current_vals) > 0 else 2.0
+    x_range = np.linspace(1.0, max(1.1, x_right), 100)
+
+    y_theory = []
+    for x in x_range:
+        y_val = fsolve(series_root(x), 0.5)[0]
+        y_theory.append(y_val * D * 3600)
+
+    return i_optimized, x_range * i_optimized * L, y_theory
+
+
+def plot_sands_analysis(
+    sands_df: pd.DataFrame,
+    cell_label: str,
+    L: float,
+    D: float,
+    last_stable_i: float,
+    first_div_i: float,
+) -> tuple[io.BytesIO, float]:
+    """Plot the Sand's time analysis and fit the limiting current.
+
+    Args:
+        sands_df: A dataframe with Sand's time and current density
+            columns.
+        cell_label: The label of the cell under test.
+        L: The electrolyte thickness, in cm.
+        D: The diffusion coefficient, in cm²/s.
+        last_stable_i: The highest current density that did not
+            diverge.
+        first_div_i: The lowest current density that diverged.
+
+    Returns:
+        A PNG image buffer of the plot, and the fitted limiting
+        current.
+    """
+    i_opt, x_theory, y_theory = solve_sands_fit(
+        sands_df, L, D, last_stable_i, first_div_i
+    )
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    plotsandsx = sands_df["Current (mA/cm^2)"] * L
+    plotsandsy = L**2 / sands_df["Sand's Time (h)"]
+
+    ax1.scatter(plotsandsx, plotsandsy, color="black", label="Data Points")
+    ax1.plot(
+        x_theory,
+        y_theory,
+        color="tab:blue",
+        label=f"Series Fit\n$i_L L = {i_opt*L:.5f}$ mA/cm",
+    )
+
+    ax1.axvline(
+        x=last_stable_i * L,
+        color="tab:red",
+        linestyle="--",
+        alpha=0.6,
+        label="Last Stable iL",
+    )
+    ax1.axvline(
+        x=first_div_i * L,
+        color="tab:green",
+        linestyle="--",
+        alpha=0.6,
+        label="First Diverged iL",
+    )
+    ax1.axvline(x=i_opt * L, color="tab:blue", linestyle=":", alpha=0.8)
+
+    ax1.set_title(f"Sand's Time Analysis: {cell_label}")
+    ax1.set_xlabel(r"$iL$ (mA/cm)")
+    ax1.set_ylabel(r"$L^2/t_{sand}$ ($cm^2/h$)")
+    ax1.set_ylim(bottom=0)
+
+    def xaxistrans(x):
+        return x / (i_opt * L)
+
+    def xaxistransinv(xtrans):
+        return xtrans * (i_opt * L)
+    secax = ax1.secondary_xaxis("top", functions=(xaxistrans, xaxistransinv))
+    secax.set_xlabel(r"$i/i_{lim}$")
+
+    ax1.legend(loc="upper left", bbox_to_anchor=(1.05, 1))
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf, i_opt
