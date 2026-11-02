@@ -13,9 +13,7 @@ from typing import Any, Callable, IO, Optional
 from plotting import (
     plot_all_EIS_precond,
     impedance_fit,
-    ECM_CIRCUITS,
     ECM_BULK_INTERFACE,
-    ECM_R1_START,
     SUMMARY_UNITS,
     get_current_from_mpr,
     plot_cp_ewe,
@@ -39,165 +37,42 @@ from validation import (
     inspect_mpr_file,
 )
 
-version = "4.7-local"
+version = "4.8-qt-only"
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
 with open(logo_path, "rb") as f:
     logo_b64 = base64.b64encode(f.read()).decode()
 
-# --- Helper Functions ---
-def get_discard_parameters() -> tuple[int, int]:
-    """Show number inputs for the left and right discard counts.
-
-    Returns:
-        The left discard count and the right discard count.
-    """
-    col1, col2 = st.columns(2)
-    with col1:
-        left = st.number_input(
-            "Points to discard (left):", min_value=0, value=2, key="left_input"
-        )
-    with col2:
-        right = st.number_input(
-            "Points to discard (right):", min_value=0, value=2, key="right_input"
-        )
-    return left, right
-
-
-def single_or_dual_ellipse(key: Optional[str] = None) -> str:
-    """Show a radio button to choose the ellipse fit mode.
-
-    Args:
-        key: A unique Streamlit widget key.
-
-    Returns:
-        The chosen fit mode label.
-    """
-    return st.radio(
-        "Fit Choice:",
-        ["Single Ellipse", "Two Ellipse (Recommended)", "Single/Two Ellipse"],
-        horizontal=True,
-        index=1,
-        key=key,
-    )
-
-
-def impedance_technique_radio(key: str) -> str:
-    """Show a radio button to choose the impedance fit technique.
-
-    Args:
-        key: A unique Streamlit widget key.
-
-    Returns:
-        The chosen technique label. The page shows the label "ECM fit
-        (modeled after impedance.py)". The return value is "ECM fit".
-    """
-    return st.radio(
-        "Technique:",
-        ["Linear fit", "Semi-ellipse fit", "ECM fit"],
-        format_func=lambda t: (
-            "ECM fit (modeled after impedance.py)" if t == "ECM fit" else t
-        ),
-        horizontal=True,
-        index=1,
-        key=key,
-        help=(
-            "ECM fit: an equivalent circuit fit to the whole spectrum. The fit "
-            "is modeled after "
-            "[impedance.py](https://impedancepy.readthedocs.io/en/latest/). "
-            "It uses the same element equations, but a faster calculation."
-        ),
-    )
-
-
-def get_ecm_parameters(key: str) -> float:
-    """Show a number input for the bulk arc capacitance limit.
-
-    Args:
-        key: A unique Streamlit widget key.
-
-    Returns:
-        The capacitance limit, in F.
-    """
-    limit_nf = st.number_input(
-        "Bulk arc if C_eff of R2|Q2 is below (nF):",
-        min_value=0.0,
-        value=1.0,
-        step=0.1,
-        format="%.2f",
-        key=key,
-        help=(
-            "If C_eff of R2|Q2 is below this limit, R2|Q2 is the bulk arc. "
-            "Then R_bulk = R1 + R2 and R_i = R3. "
-            "If not, R_bulk = R1 and R_i = R2 + R3."
-        ),
-    )
-    return limit_nf * 1e-9
+def impedance_fit_label(key: str) -> str:
+    """Show the fixed circuit used in every EIS workflow."""
+    st.markdown('**Circuit: (Rb ∥ Qb) + (Ri ∥ Qi) + Qt**')
+    return 'ECM fit'
 
 
 def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
-    """Show the widgets for the chosen impedance fit technique.
+    """Use the same whole-spectrum Qt fit in every workflow."""
+    return {'technique': 'ECM fit', 'ecm_circuit': ECM_BULK_INTERFACE,
+            'ecm_remove_tail': False, 'bulk_c_threshold': None}
 
-    Show the discard inputs and the ellipse fit choice for the
-    semi-ellipse fit. Show the bulk arc capacitance limit for the ECM
-    fit.
 
-    Args:
-        technique: The chosen impedance fit technique.
-        key_prefix: The prefix for the unique Streamlit widget keys.
+def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Record the exact model and solver in exported analysis metadata."""
+    return [
+        ('Technique', 'ECM fit'), ('Circuit', ECM_BULK_INTERFACE),
+        ('Assignment', 'R_bulk = Rb (higher-frequency branch); R_i = Ri; model assumption'),
+        ('Series resistor', 'None'), ('Capacitance cutoff', 'Not used'),
+        ('Points', 'All finite, nonzero impedance points with positive frequency; no tail removal'),
+        ('Weighting', 'Complex residuals divided by measured |Z|'),
+        ('Optimizer', 'SciPy least_squares TRF; log-positive parameters; 36 deterministic starts per cycle; seed 20261101; no warm start'),
+        ('Bounds', 'R: 1e-6 to 1e10 Ohm; Q: 1e-18 to 1 Ohm^-1 s^n; nb/ni: 0.3 to 1; nt: 0.05 to 1'),
+        ('Tolerances', 'ftol = xtol = gtol = 1e-9; max_nfev = 2500'),
+        ('Uncertainty', 'Local errors conditional on model; unavailable for rank deficiency, parameters at bounds, or Q/n of arcs with unmeasured peaks; start spread is not a confidence interval'),
+        ('Interpretation', 'Qt near nt=0.05 is nearly resistive; branch labels alone do not establish physical bulk/interface identity'),
+    ]
 
-    Returns:
-        The fit settings. The keys are "technique", "discard_left",
-        "discard_right", "fit_choice", "ecm_circuit", "ecm_remove_tail",
-        and "bulk_c_threshold". A key that the technique does not use has
-        the value None.
-    """
-    settings = {
-        "technique": technique,
-        "discard_left": None,
-        "discard_right": None,
-        "fit_choice": None,
-        "ecm_circuit": None,
-        "ecm_remove_tail": None,
-        "bulk_c_threshold": None,
-    }
-    if technique == "ECM fit":
-        settings["ecm_circuit"] = st.selectbox(
-            "Circuit:",
-            list(ECM_CIRCUITS),
-            index=0,
-            key=f"{key_prefix}_ecm_circuit",
-            help=(
-                "Q is a constant phase element. "
-                "W is a Warburg element for the diffusion tail."
-            ),
-        )
-        if ECM_CIRCUITS[settings["ecm_circuit"]][1]:
-            st.caption("The fit uses the whole spectrum.")
-        else:
-            tail_choice = st.radio(
-                "Diffusion tail:",
-                ["Remove tail before fitting", "Fit all points"],
-                horizontal=True,
-                index=0,
-                key=f"{key_prefix}_ecm_tail",
-                help=(
-                    "Remove: the app finds the valley between the last arc and "
-                    "the low-frequency rise, and does not fit the points after it. "
-                    "Use 'Fit all points' if the spectrum has no clear valley, for "
-                    "example a quarter circle that rises to the lowest frequency."
-                ),
-            )
-            settings["ecm_remove_tail"] = tail_choice == "Remove tail before fitting"
-        if settings["ecm_circuit"] != ECM_BULK_INTERFACE:
-            settings["bulk_c_threshold"] = get_ecm_parameters(f"{key_prefix}_bulk_c")
-    else:
-        left, right = get_discard_parameters()
-        settings["discard_left"] = left
-        settings["discard_right"] = right
-        settings["fit_choice"] = single_or_dual_ellipse(f"{key_prefix}_fit_choice")
-    return settings
+
+# --- Helper Functions ---
 
 
 def fit_progress_bar(label: str) -> tuple[Callable[[int, int, int], None], Any]:
@@ -233,8 +108,7 @@ def show_params_table(df: pd.DataFrame) -> None:
     Returns:
         None.
     """
-    parameter_names = {"Rb", "Qb", "nb", "Ri", "Qi", "ni", "A_W",
-                       "R1", "R2", "Q2", "n2", "R3", "Q3", "n3"}
+    parameter_names = {"Rb", "Qb", "nb", "Ri", "Qi", "ni", "Qt", "nt"}
     columns = [c for c in df.columns
                if c in {"Cycle", "Run", "Fit error (%)"}
                or c.split(" (")[0] in parameter_names]
@@ -510,7 +384,7 @@ def fit_current_fraction_eis_resistances(
     Returns:
         A dictionary of fitted resistances, a combined fit table
         dataframe, and a combined ECM fit parameter dataframe (None for
-        the semi-ellipse fit). The fit table has units in the column
+        failed fits). The fit table has units in the column
         names.
     """
     resistances = {}
@@ -623,59 +497,6 @@ def build_metadata_text(
         lines += ["", section_title, "-" * len(section_title)]
         lines += [f"{name}: {value}" for name, value in entries]
     return "\r\n".join(lines) + "\r\n"
-
-
-def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
-    """List the EIS fit settings for a metadata file.
-
-    Give only the values that the chosen technique uses.
-
-    Args:
-        settings: The fit settings. See get_fit_settings.
-
-    Returns:
-        A list of (name, value) pairs.
-    """
-    if settings["technique"] == "ECM fit":
-        if settings["ecm_circuit"] == ECM_BULK_INTERFACE:
-            return [
-                ("Technique", settings["technique"]),
-                ("Circuit", ECM_BULK_INTERFACE),
-                ("Assignment", "R_bulk = Rb (higher-frequency branch); R_i = Ri; model assumption"),
-                ("Series resistor", "None"),
-                ("Capacitance cutoff", "Not used"),
-                ("Points", "All finite, nonzero impedance points with positive frequency; no tail removal"),
-                ("Weighting", "Residuals divided by |Z|"),
-                ("Optimizer", "SciPy least_squares TRF; log-positive parameters; 18 deterministic starts per cycle; no warm start"),
-                ("Bounds", "R: 1e-6 to 1e10 Ohm; Q: 1e-18 to 1 Ohm^-1 s^n; n: 0.3 to 1; A_W: 1e-12 to 1e10 Ohm s^-1/2"),
-                ("Tolerances", "ftol = xtol = gtol = 1e-9; max_nfev = 2500"),
-                ("Uncertainty", "Local linearized standard errors, conditional on model; Qb/nb errors withheld if bulk peak outside range; start spread is not a confidence interval"),
-            ]
-        return [
-            ("Technique", settings["technique"]),
-            ("Circuit", settings["ecm_circuit"]),
-            (
-                "Diffusion tail",
-                # A circuit with W shows no Diffusion tail choice.
-                "Fit all points (the circuit has W)"
-                if ECM_CIRCUITS[settings["ecm_circuit"]][1]
-                else "Remove tail before fitting"
-                if settings["ecm_remove_tail"]
-                else "Fit all points",
-            ),
-            ("Weighting", "|Z| (modulus)"),
-            ("R1 start value (Ohm)", ECM_R1_START),
-            (
-                "Bulk arc if C_eff of R2|Q2 is below (nF)",
-                round(settings["bulk_c_threshold"] * 1e9, 6),
-            ),
-        ]
-    return [
-        ("Technique", settings["technique"]),
-        ("Points to discard (left)", int(settings["discard_left"])),
-        ("Points to discard (right)", int(settings["discard_right"])),
-        ("Fit Choice", settings["fit_choice"]),
-    ]
 
 
 def current_metadata_text(meta_key: str) -> str:
@@ -1204,7 +1025,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.caption("*Check the ⋮ menu (top right) for app info and acknowledgements.*")
+st.caption("Qt circuit edition · (Rb ∥ Qb) + (Ri ∥ Qi) + Qt")
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
@@ -1316,12 +1137,9 @@ if cell_type and cell_label and uploaded_files:
 
         st.divider()
 
-        tech = impedance_technique_radio("single_impedance_technique")
+        tech = impedance_fit_label("single_impedance_technique")
 
-        if tech == "Linear fit":
-            show_warning("This technique is not yet supported.")
-
-        if tech in ("Semi-ellipse fit", "ECM fit"):
+        if tech == "ECM fit":
             fit_settings = get_fit_settings(tech, "single")
 
             if st.button("Generate EIS Plots", key="single_generate_button"):
@@ -1398,12 +1216,9 @@ if cell_type and cell_label and uploaded_files:
 
             selections = {"Positive": pos_peis_name, "Negative": neg_peis_name}
             st.divider()
-            tech = impedance_technique_radio("preconditioning_impedance_technique")
+            tech = impedance_fit_label("preconditioning_impedance_technique")
 
-            if tech == "Linear fit":
-                show_warning("This technique is not yet supported.")
-
-            if tech in ("Semi-ellipse fit", "ECM fit"):
+            if tech == "ECM fit":
                 fit_settings = get_fit_settings(tech, "preconditioning")
 
                 generate_col, metadata_col, _ = st.columns([1, 1, 3])
@@ -1689,12 +1504,9 @@ if cell_type and cell_label and uploaded_files:
         st.divider()
         st.write("#### C. Impedance Data")
 
-        tech = impedance_technique_radio("limiting_current_impedance_technique")
+        tech = impedance_fit_label("limiting_current_impedance_technique")
 
-        if tech == "Linear fit":
-            show_warning("This technique is not yet supported.")
-
-        if tech in ("Semi-ellipse fit", "ECM fit"):
+        if tech == "ECM fit":
 
             fit_settings = get_fit_settings(tech, "limiting_current")
 
@@ -1733,8 +1545,7 @@ if cell_type and cell_label and uploaded_files:
                         fit_df["Run_no"] = b["run_no"]
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
-                        # The ellipse fit gives the arc columns. The ECM fit
-                        # gives the fit error column.
+                        # Export nominal branch resistances and the fit error.
                         lc_columns = [
                             "Run_no",
                             "Current (mA/cm^2)",
@@ -1996,10 +1807,7 @@ if cell_type and cell_label and uploaded_files:
                 "Please select a distinct file for each polarity."
             )
 
-        cf_tech = impedance_technique_radio("current_fraction_impedance_technique")
-        if cf_tech == "Linear fit":
-            show_warning("This technique is not yet supported.")
-            st.stop()
+        cf_tech = impedance_fit_label("current_fraction_impedance_technique")
         fit_settings = get_fit_settings(cf_tech, "current_fraction")
 
         st.write("#### Uploaded CA/OCV MPR Files")

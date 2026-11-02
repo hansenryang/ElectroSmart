@@ -3,35 +3,14 @@ import numpy as np
 import pandas as pd
 import io
 from galvani import BioLogic
-from scipy.optimize import fsolve, fmin, curve_fit, least_squares
+from scipy.optimize import fsolve, fmin, curve_fit
 from scipy.signal import find_peaks, savgol_filter
 import re
 from typing import Any, Callable, IO, Optional, Union
 
-# The ECM circuits. Each value is the number of R|Q arcs, and True if the
-# circuit has a semi-infinite Warburg element W. See ecm_model.
-#
-# Credit: the ECM fit is a cheaper and faster version of the circuit fit in
-# impedance.py (Murbach et al., "impedance.py: A Python package for
-# electrochemical impedance analysis", J. Open Source Softw. 5 (2020) 2349,
-# https://github.com/ECSHackWeek/impedance.py, MIT license). The element
-# equations (R, CPE, W), the 1/|Z| weighting, and the standard errors follow
-# impedance.py. This code evaluates the circuits directly with numpy. It
-# does not build the circuit from a text string for each call, so the fit
-# is approximately 3 to 10 times faster.
-ECM_BULK_INTERFACE = "Rb|Qb + Ri|Qi + W"
-
-ECM_CIRCUITS: dict[str, tuple[int, bool]] = {
-    ECM_BULK_INTERFACE: (2, True),
-    "R1 + R2|Q2 + R3|Q3": (2, False),
-    "R1 + R2|Q2 + R3|Q3 + W": (2, True),
-    "R1 + R2|Q2": (1, False),
-    "R1 + R2|Q2 + W": (1, True),
-}
-ECM_R1_START = 0.1
-
-# The units of the ECM parameters, for the tables and the plot legends.
-ECM_UNITS = {"R": "Ohm", "Q": "Ohm^-1 s^n", "n": "-", "A_W": "Ohm s^-1/2"}
+# The sole EIS circuit for this branch. Q coefficients use CPE units.
+from qt_circuit import CIRCUIT as ECM_BULK_INTERFACE
+from qt_circuit import PARAMETER_NAMES, PARAMETER_UNITS, fit_spectrum
 
 # The column names with units for the summary tables of both fits. The
 # analyses calculate with the names without units.
@@ -168,279 +147,6 @@ def plot_all_CP_LC(
     return cp_plot_buf
 
 
-def semi_ellipse(
-    x: np.ndarray, xc: float, yc: float, Rx: float, Ry: float
-) -> np.ndarray:
-    """Compute the upper half of an ellipse at each x value.
-
-    Args:
-        x: The x values to evaluate.
-        xc: The x coordinate of the ellipse center.
-        yc: The y coordinate of the ellipse center.
-        Rx: The x radius of the ellipse.
-        Ry: The y radius of the ellipse.
-
-    Returns:
-        The y values on the upper half of the ellipse.
-    """
-    z = (x - xc) / Rx
-    return yc + Ry * np.sqrt(np.maximum(1 - z**2, 0))
-
-
-def solve_ellipse_xints(
-    xc: float, yc: float, Rx: float, Ry: float
-) -> tuple[float, float]:
-    """Find the left and right x-intercepts of an ellipse at y = 0.
-
-    Args:
-        xc: The x coordinate of the ellipse center.
-        yc: The y coordinate of the ellipse center.
-        Rx: The x radius of the ellipse.
-        Ry: The y radius of the ellipse.
-
-    Returns:
-        The left x-intercept and the right x-intercept.
-    """
-    term = np.sqrt(abs(1 - (yc / Ry) ** 2))
-    return xc - Rx * term, xc + Rx * term
-
-
-def obj_one_ellipse(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
-    """Compute the sum of squared errors for a one-ellipse fit.
-
-    Reject invalid radii with a large penalty value.
-
-    Args:
-        params: The fit parameters xc, yc, Rx, Ry.
-        x: The measured x values.
-        y: The measured y values.
-
-    Returns:
-        The sum of squared errors, or 1e12 for invalid radii.
-    """
-    xc, yc, Rx, Ry = params
-    if Rx <= 0 or Ry <= 0:
-        return 1e12
-    return np.sum((y - semi_ellipse(x, xc, yc, Rx, Ry)) ** 2)
-
-
-def obj_two_ellipses(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
-    """Compute the sum of squared errors for a two-ellipse fit.
-
-    Take the upper envelope of the two ellipses at each x value. Reject
-    invalid radii with a large penalty value.
-
-    Args:
-        params: The fit parameters for both ellipses.
-        x: The measured x values.
-        y: The measured y values.
-
-    Returns:
-        The sum of squared errors, or 1e12 for invalid radii.
-    """
-    xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = params
-    if any(p <= 0 for p in [Rx1, Ry1, Rx2, Ry2]):
-        return 1e12
-    y1 = semi_ellipse(x, xc1, yc1, Rx1, Ry1)
-    y2 = semi_ellipse(x, xc2, yc2, Rx2, Ry2)
-    return np.sum((y - np.maximum(y1, y2)) ** 2)
-
-
-def calculate_bic(rss: float, n: int, k: int) -> float:
-    """Calculate the Bayesian Information Criterion for a fit.
-
-    Args:
-        rss: The residual sum of squares from the fit.
-        n: The number of data points.
-        k: The number of free parameters in the fit.
-
-    Returns:
-        The BIC value. Return 1e12 if rss is not positive.
-    """
-    if rss <= 0:
-        return 1e12
-    return n * np.log(rss / n) + k * np.log(n)
-
-
-def find_both_mins(df: pd.DataFrame, peak_idx: int) -> tuple[int, int]:
-    """Find the left and right local minimum points around a peak.
-
-    Search left from the peak for the lowest point. Search right from
-    the peak for the lowest point.
-
-    Args:
-        df: A dataframe with the imaginary impedance in column 1.
-        peak_idx: The row index of the peak.
-
-    Returns:
-        The row index of the left minimum and the row index of the
-        right minimum.
-    """
-    Im_Z = df.iloc[:, 1].values
-    n_rows = len(Im_Z)
-    left_min_idx = 0
-    left_min_val = Im_Z[0]
-    for i in range(peak_idx):
-        if Im_Z[i] < left_min_val:
-            left_min_val = Im_Z[i]
-            left_min_idx = i
-    right_min_idx = peak_idx
-    right_min_val = Im_Z[peak_idx]
-    for i in range(peak_idx, n_rows):
-        if Im_Z[i] < right_min_val:
-            right_min_val = Im_Z[i]
-            right_min_idx = i
-    return left_min_idx, right_min_idx
-
-
-def semiellipse_fit(
-    cell_type: str,
-    cell_label: str,
-    no_left_idx_to_throw: int,
-    no_right_idx_to_throw: int,
-    data_filename: IO[bytes],
-    run_label: str,
-    must_use_dual: bool,
-    must_use_single: bool,
-    cycle_title: Optional[str] = None,
-    progress: Optional[Callable[[int, int, int], None]] = None,
-) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
-    """Fit each PEIS cycle in an MPR file with one or two semi-ellipses.
-
-    For each cycle, trim points near the ends. Fit a single ellipse and
-    a two-ellipse model. Choose the model with the lower BIC score,
-    unless the caller forces one model. Compute R_bulk and R_i from the
-    fit. Plot each cycle fit and the trend across cycles.
-
-    Args:
-        cell_type: The type of analysis, for example "Preconditioning".
-        cell_label: The label of the cell under test.
-        no_left_idx_to_throw: The number of points to discard from the
-            left.
-        no_right_idx_to_throw: The number of points to discard from the
-            right.
-        data_filename: An MPR file object that contains PEIS data.
-        run_label: The label for this run, for example "Positive".
-        must_use_dual: Force the two-ellipse model for every cycle.
-        must_use_single: Force the one-ellipse model for every cycle.
-        cycle_title: The title for each cycle plot. If None, use the
-            cell label, the run label, and the cycle number.
-        progress: A function that the fit calls before each cycle with
-            the number of finished cycles, the cycle count, and the cycle
-            number.
-
-    Returns:
-        A tuple with the summary dataframe, the trend plot buffer, the
-        summary CSV buffer, and a list of (file name, image buffer)
-        pairs for each cycle.
-    """
-    data_filename.seek(0)
-    mpr = BioLogic.MPRfile(data_filename)
-    df_raw = pd.DataFrame(mpr.data)
-    cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
-    results_list = []
-    cycle_images = []
-    for i, c in enumerate(cycle_nums):
-        if progress is not None:
-            progress(i, len(cycle_nums), int(c))
-        df_cycle = df_raw[df_raw["cycle number"] == c].reset_index(drop=True)
-        df_clean = df_cycle[["Re(Z)/Ohm", "-Im(Z)/Ohm"]]
-        no_rows = len(df_clean)
-        l_idx, r_idx = find_both_mins(df_clean, peak_idx=no_rows // 4)
-        if no_rows > 10:
-            l_idx += no_left_idx_to_throw
-            r_idx -= no_right_idx_to_throw
-        l_idx = max(0, l_idx)
-        r_idx = min(no_rows - 1, r_idx)
-        idx_list = range(l_idx, r_idx + 1)
-        df_masked = df_clean.iloc[idx_list, :]
-        x_fit = df_masked.iloc[:, 0].values
-        y_fit = df_masked.iloc[:, 1].values
-        n = len(x_fit)
-        start_val, end_val = x_fit[0], x_fit[-1]
-        res_one = fmin(
-            obj_one_ellipse,
-            [(start_val + end_val) / 2, 0, (end_val - start_val) / 2, np.max(y_fit)],
-            args=(x_fit, y_fit),
-            disp=False,
-        )
-        bic_one = calculate_bic(obj_one_ellipse(res_one, x_fit, y_fit), n, 4)
-        mid_x = (start_val + end_val) / 2
-        guess_two = [
-            (start_val + mid_x) / 2,
-            0,
-            (mid_x - start_val) / 2,
-            np.max(y_fit) * 0.5,
-            (mid_x + end_val) / 2,
-            0,
-            (end_val - mid_x) / 2,
-            np.max(y_fit),
-        ]
-        res_two = fmin(
-            obj_two_ellipses, guess_two, args=(x_fit, y_fit), disp=False, maxiter=2000
-        )
-        bic_two = calculate_bic(obj_two_ellipses(res_two, x_fit, y_fit), n, 8)
-        use_dual = (bic_two < bic_one or must_use_dual) and not must_use_single
-        if use_dual:
-            xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = res_two
-            l1, r1 = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            l2, r2 = solve_ellipse_xints(xc2, yc2, Rx2, Ry2)
-            r_bulk_raw = l1 if abs(l1 - start_val) <= abs(l2 - start_val) else l2
-            r_total_raw = r1 if abs(r1 - end_val) <= abs(r2 - end_val) else r2
-        else:
-            xc1, yc1, Rx1, Ry1 = res_one
-            r_bulk_raw, r_total_raw = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            xc2 = yc2 = Rx2 = Ry2 = np.nan
-        r_bulk = r_bulk_raw if r_bulk_raw >= 0 else x_fit[0]
-        ri = r_total_raw - r_bulk
-        r_bulk_arc = np.min(x_fit)
-        ri_arc = r_total_raw - r_bulk_arc
-        fig_ind = plt.figure(figsize=(8, 4))
-        plt.scatter(
-            df_clean.iloc[:, 0], df_clean.iloc[:, 1], color="lightgray", alpha=0.3
-        )
-        plt.scatter(x_fit, y_fit, color="darkblue", s=10)
-        x_plot = np.linspace(r_bulk, r_total_raw, 500)
-        y_p = (
-            np.maximum(
-                semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1),
-                semi_ellipse(x_plot, xc2, yc2, Rx2, Ry2),
-            )
-            if use_dual
-            else semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1)
-        )
-        lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
-        plt.plot(x_plot, y_p, "r-", label=lbl)
-        plt.title(
-            cycle_title
-            if cycle_title is not None
-            else f"{cell_label} {run_label} Cycle {int(c)}"
-        )
-        plt.xlabel("Re(Z)/Ohm")
-        plt.ylabel("-Im(Z)/Ohm")
-        plt.gca().set_aspect("equal")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1))
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
-        cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
-        fig_ind.clear()
-        plt.close(fig_ind)
-        results_list.append(
-            {
-                "Cycle": int(c),
-                "R_bulk": r_bulk,
-                "R_i": ri,
-                "R_total": r_total_raw,
-                "R_bulk_arc": r_bulk_arc,
-                "R_i_arc": ri_arc,
-            }
-        )
-    summary_df = pd.DataFrame(results_list).sort_values(by="Cycle")
-    sum_buf, csv_buf = plot_resistance_trend(summary_df, cell_label, run_label)
-    return summary_df, sum_buf, csv_buf, cycle_images
-
-
 def plot_resistance_trend(
     summary_df: pd.DataFrame, cell_label: str, run_label: str
 ) -> tuple[io.BytesIO, io.StringIO]:
@@ -480,251 +186,6 @@ def plot_resistance_trend(
     fig_sum.clear()
     plt.close(fig_sum)
     return sum_buf, csv_buf
-
-
-def ecm_initial_guesses(
-    f: np.ndarray, Z: np.ndarray, n_arcs: int, warburg: bool
-) -> list[list[float]]:
-    """Make three starting points for the ECM fit.
-
-    Make three starts from the valleys of -Im(Z). Do not cut the data
-    with the valleys. If the circuit has no Warburg element, make two
-    more starts from the lowest Re(Z), the highest Re(Z), and the apex
-    of -Im(Z). These two starts suit data without a diffusion tail.
-
-    Args:
-        f: The frequencies, in Hz.
-        Z: The complex impedances, in Ohm.
-        n_arcs: The number of R|Q arcs in the circuit, 1 or 2.
-        warburg: Add a starting value for the Warburg coefficient.
-
-    Returns:
-        A list of parameter lists in the order R1, R2, Q2, n2, then R3,
-        Q3, n3 if n_arcs is 2, then A_W if warburg is True.
-    """
-    x = Z.real
-    y = -Z.imag
-    n_pts = len(x)
-    l_idx, r_idx = find_both_mins(pd.DataFrame({"x": x, "y": y}), n_pts // 4)
-    starts = []
-    r_hf = x[l_idx]
-    r_lf = x[r_idx] if r_idx > l_idx else x.max()
-    seg = slice(l_idx, r_idx + 1) if r_idx > l_idx else slice(0, n_pts)
-    f_apex = f[seg][np.argmax(y[seg])]
-    for r1, share in (
-        (ECM_R1_START, 0.0),
-        (max(r_hf, 1e-3), 0.25),
-        (max(r_hf * 0.5, 1e-3), 0.5),
-    ):
-        starts.append((r1, share, r_hf, r_lf, f_apex))
-    if not warburg:
-        r_hf_all = x.min()
-        f_apex_all = f[np.argmax(y)]
-        for r1, share in ((max(r_hf_all, 1e-3), 0.1), (max(r_hf_all * 0.5, 1e-3), 0.5)):
-            starts.append((r1, share, r_hf_all, x.max(), f_apex_all))
-
-    n0 = 0.85
-    guesses = []
-    for r1, share, r_hf, r_lf, f_apex in starts:
-        width = max(r_lf - r_hf, 1e-6)
-        if n_arcs == 2:
-            r2 = max(r_hf - r1 + share * width, 1e-4)
-            r3 = max(r_lf - r1 - r2, 1e-4)
-            q2 = min((1 / (2 * np.pi * f_apex * 100)) ** n0 / r2, 0.5)
-            q3 = min((1 / (2 * np.pi * f_apex)) ** n0 / r3, 0.5)
-            guess = [r1, r2, q2, n0, r3, q3, n0]
-        else:
-            r2 = max(r_lf - r1, 1e-4)
-            q2 = min((1 / (2 * np.pi * f_apex)) ** n0 / r2, 0.5)
-            guess = [r1, r2, q2, n0]
-        if warburg:
-            w_min = 2 * np.pi * f.min()
-            guess.append(max(y[-1], width * 0.05) * np.sqrt(w_min))
-        # galvani gives float32 values. impedance.py accepts only Python floats.
-        guesses.append([float(v) for v in guess])
-    return guesses
-
-
-def ecm_parameter_names(n_arcs: int, warburg: bool) -> list[tuple[str, str]]:
-    """List the names and units of the parameters of one ECM circuit.
-
-    Args:
-        n_arcs: The number of R|Q arcs, 1 or 2.
-        warburg: The circuit has a Warburg element.
-
-    Returns:
-        A list of (name, unit) pairs in the parameter order of
-        ecm_model.
-    """
-    names = [("R1", "R"), ("R2", "R"), ("Q2", "Q"), ("n2", "n")]
-    if n_arcs == 2:
-        names += [("R3", "R"), ("Q3", "Q"), ("n3", "n")]
-    if warburg:
-        names.append(("A_W", "A_W"))
-    return [(name, ECM_UNITS[kind]) for name, kind in names]
-
-
-def ecm_circuit_string(n_arcs: int, warburg: bool) -> str:
-    """Give the circuit string of one ECM circuit.
-
-    Use the syntax of impedance.py with the element names of the app.
-    For example, R1 + R2|Q2 + R3|Q3 + W gives "R1-p(R2,Q2)-p(R3,Q3)-W".
-
-    Args:
-        n_arcs: The number of R|Q arcs, 1 or 2.
-        warburg: The circuit has a Warburg element.
-
-    Returns:
-        The circuit string.
-    """
-    text = "R1-p(R2,Q2)"
-    if n_arcs == 2:
-        text += "-p(R3,Q3)"
-    if warburg:
-        text += "-W"
-    return text
-
-
-def ecm_model(
-    params: np.ndarray, f: np.ndarray, n_arcs: int, warburg: bool
-) -> np.ndarray:
-    """Calculate the impedance of one circuit from ECM_CIRCUITS.
-
-    Use Z = R1 + R2 / (1 + R2 Q2 (j w)^n2) + R3 / (1 + R3 Q3 (j w)^n3)
-    + A_W (1 - j) / sqrt(w). Omit the R3|Q3 term if n_arcs is 1. Omit
-    the W term if warburg is False.
-
-    This function is a cheaper and faster version of the circuit
-    evaluation in impedance.py. The equations are the same as the R,
-    CPE, and W elements of impedance.py. The results agree to machine
-    precision. See the credit note above ECM_CIRCUITS.
-
-    Args:
-        params: The parameters in the order R1, R2, Q2, n2, then R3,
-            Q3, n3 if n_arcs is 2, then A_W if warburg is True.
-        f: The frequencies, in Hz.
-        n_arcs: The number of R|Q arcs, 1 or 2.
-        warburg: The circuit has a Warburg element.
-
-    Returns:
-        The complex impedance at each frequency, in Ohm.
-    """
-    omega = 2 * np.pi * f
-    z = params[0] + ecm_rq_impedance(f, params[1], params[2], params[3])
-    if n_arcs == 2:
-        z = z + ecm_rq_impedance(f, params[4], params[5], params[6])
-    if warburg:
-        z = z + params[-1] * (1 - 1j) / np.sqrt(omega)
-    return z
-
-
-def fit_ecm_spectrum(
-    f: np.ndarray,
-    Z: np.ndarray,
-    circuit_label: str,
-    previous: Optional[list[float]] = None,
-) -> dict[str, Any]:
-    """Fit one equivalent circuit from ECM_CIRCUITS to one spectrum.
-
-    Fit the circuit from each starting point with a complex nonlinear
-    least-squares fit (scipy least_squares). Weight each point by
-    1/|Z|. Keep the fit with the lowest weighted residual. In a circuit
-    with two arcs, put the arc with the higher characteristic frequency
-    in R2|Q2.
-
-    This function is a cheaper and faster version of
-    CustomCircuit.fit(weight_by_modulus=True) in impedance.py. See the
-    credit note above ECM_CIRCUITS.
-
-    Args:
-        f: The frequencies, in Hz.
-        Z: The complex impedances, in Ohm.
-        circuit_label: A key of ECM_CIRCUITS.
-        previous: The best parameters of the previous cycle.
-
-    Returns:
-        A dictionary with the parameters, the standard errors, the
-        initial guesses of the best start, the convergence flag, a
-        function that calculates the fitted impedance at given
-        frequencies, and the parameters in the fit order.
-
-    Raises:
-        RuntimeError: No fit converged.
-    """
-    if circuit_label == ECM_BULK_INTERFACE:
-        from bulk_interface import fit_spectrum
-        return fit_spectrum(f, Z)
-    n_arcs, warburg = ECM_CIRCUITS[circuit_label]
-    lower = [0, 0, 1e-15, 0.3] + ([0, 1e-15, 0.3] if n_arcs == 2 else [])
-    upper = [np.inf, np.inf, 1, 1] + ([np.inf, 1, 1] if n_arcs == 2 else [])
-    if warburg:
-        lower.append(0)
-        upper.append(np.inf)
-    guesses = ecm_initial_guesses(f, Z, n_arcs, warburg)
-    if previous is not None and len(previous) == len(lower):
-        guesses.insert(0, list(previous))
-    weight = np.abs(Z)
-
-    def residuals(p: np.ndarray) -> np.ndarray:
-        d = (Z - ecm_model(p, f, n_arcs, warburg)) / weight
-        return np.concatenate([d.real, d.imag])
-
-    best = None
-    best_guess = None
-    for guess in guesses:
-        guess = np.clip(guess, lower, upper)
-        try:
-            result = least_squares(
-                residuals,
-                guess,
-                bounds=(lower, upper),
-                method="trf",
-                x_scale="jac",
-                max_nfev=5000,
-            )
-        except Exception:
-            continue
-        if best is None or result.cost < best.cost:
-            best = result
-            best_guess = [float(v) for v in guess]
-    if best is None:
-        raise RuntimeError("No ECM fit converged.")
-
-    fit_params = [float(v) for v in best.x]
-    # Standard errors as in curve_fit with relative sigma (impedance.py):
-    # cov = (J^T J)^-1 * RSS / (N - p), from the SVD of J. Scale each column
-    # by its parameter value first, because Q (about 1e-10) and R (about
-    # 1e3) differ by many orders of magnitude.
-    n_res = len(best.fun)
-    dof = max(n_res - len(fit_params), 1)
-    scale = np.where(np.abs(best.x) > 0, np.abs(best.x), 1.0)
-    try:
-        _, sing, vt = np.linalg.svd(best.jac * scale, full_matrices=False)
-        threshold = np.finfo(float).eps * max(best.jac.shape) * sing[0]
-        keep_sv = sing > threshold
-        cov_scaled = (vt[keep_sv].T / sing[keep_sv] ** 2) @ vt[keep_sv]
-        cov = cov_scaled * np.outer(scale, scale) * (2 * best.cost / dof)
-        conf = [float(v) for v in np.sqrt(np.abs(np.diag(cov)))]
-    except np.linalg.LinAlgError:
-        conf = [np.nan] * len(fit_params)
-    params = list(fit_params)
-    initial = list(best_guess)
-
-    # Put the arc with the higher characteristic frequency first.
-    if n_arcs == 2 and (
-        ecm_arc_frequency(*params[4:7]) > ecm_arc_frequency(*params[1:4])
-    ):
-        params[1:4], params[4:7] = params[4:7], params[1:4]
-        conf[1:4], conf[4:7] = conf[4:7], conf[1:4]
-        initial[1:4], initial[4:7] = initial[4:7], initial[1:4]
-    return {
-        "params": params,
-        "conf": conf,
-        "initial": initial,
-        "success": bool(best.success),
-        "predict": lambda freq: ecm_model(best.x, freq, n_arcs, warburg),
-        "fit_params": fit_params,
-    }
 
 
 def ecm_arc_frequency(r: float, q: float, n: float) -> float:
@@ -777,313 +238,6 @@ def ecm_rq_impedance(f: np.ndarray, r: float, q: float, n: float) -> np.ndarray:
     return r / (1 + r * q * (2j * np.pi * f) ** n)
 
 
-def find_diffusion_tail(f: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Find the points of the low-frequency diffusion tail.
-
-    Sort the points from high to low frequency. Find the lowest -Im(Z)
-    point in the last two thirds of the spectrum. This point is the
-    valley between the last arc and the tail. The points below the
-    valley frequency are the tail.
-
-    Args:
-        f: The frequencies, in Hz.
-        y: The values of -Im(Z), in Ohm.
-
-    Returns:
-        A boolean array in the order of the input. True marks a tail
-        point. All values are False if the spectrum has no tail.
-    """
-    is_tail = np.zeros(len(f), dtype=bool)
-    order = np.argsort(-f)
-    y_sorted = y[order]
-    n_pts = len(y_sorted)
-    if n_pts < 6:
-        return is_tail
-    # A 3-point median removes single noisy points.
-    smooth = np.array(
-        [np.median(y_sorted[max(0, i - 1) : i + 2]) for i in range(n_pts)]
-    )
-    # A noisy flat tail rises and falls, so do not stop at the first rise.
-    # Keep at least the first third of the spectrum for the arcs.
-    start = n_pts // 3
-    valley = start + int(np.argmin(smooth[start:]))
-    # The median can shift the valley by one point. Use the raw minimum.
-    lo = max(start, valley - 1)
-    valley = lo + int(np.argmin(y_sorted[lo : valley + 2]))
-    n_tail = n_pts - 1 - valley
-    if n_tail < 3:
-        return is_tail
-    is_tail[order[valley + 1 :]] = True
-    return is_tail
-
-
-def ecm_fit(
-    cell_type: str,
-    cell_label: str,
-    data_filename: IO[bytes],
-    run_label: str,
-    circuit_label: str,
-    bulk_c_threshold: Optional[float],
-    remove_tail: bool = True,
-    cycle_title: Optional[str] = None,
-    progress: Optional[Callable[[int, int, int], None]] = None,
-) -> tuple[
-    pd.DataFrame,
-    pd.DataFrame,
-    io.BytesIO,
-    io.StringIO,
-    list[tuple[str, io.BytesIO]],
-]:
-    """Fit each PEIS cycle in an MPR file with an equivalent circuit.
-
-    Fit the chosen circuit to the whole spectrum. Drop the points with
-    -Im(Z) <= 0. If the circuit has no Warburg element and remove_tail
-    is True, also drop the low-frequency diffusion tail (see
-    find_diffusion_tail). Use the
-    effective capacitance of R2|Q2 to find the bulk arc. Plot each
-    cycle fit and the trend across cycles.
-
-    Args:
-        cell_type: The type of analysis, for example "Preconditioning".
-        cell_label: The label of the cell under test.
-        data_filename: An MPR file object that contains PEIS data.
-        run_label: The label for this run, for example "Positive".
-        circuit_label: A key of ECM_CIRCUITS.
-        bulk_c_threshold: The capacitance limit for the bulk arc, in F.
-            If C_eff of R2|Q2 is below this limit, R2 is bulk resistance.
-        remove_tail: Drop the diffusion tail before the fit. The app
-            uses this value only for a circuit without a Warburg element.
-        cycle_title: The title for each cycle plot. If None, use the
-            cell label, the run label, and the cycle number.
-        progress: A function that the fit calls before each cycle with
-            the number of finished cycles, the cycle count, and the cycle
-            number.
-
-    Returns:
-        A tuple with the summary dataframe (Cycle, R_bulk, R_i, R_total,
-        and Fit error (%)), the fit parameter dataframe, the trend plot
-        buffer, the summary CSV buffer, and a list of (file name, image
-        buffer) pairs for each cycle. The fit parameter dataframe has the
-        value, the standard error, and the initial guess of each
-        parameter, with units in the column names. The summary CSV has
-        units in the column names.
-    """
-    n_arcs, warburg = ECM_CIRCUITS[circuit_label]
-    direct_bulk = circuit_label == ECM_BULK_INTERFACE
-    names = ecm_parameter_names(n_arcs, warburg)
-    if direct_bulk:
-        names = [("fixed offset", "Ohm"), ("Rb", "Ohm"), ("Qb", ECM_UNITS["Q"]),
-                 ("nb", "-"), ("Ri", "Ohm"), ("Qi", ECM_UNITS["Q"]),
-                 ("ni", "-"), ("A_W", ECM_UNITS["A_W"])]
-    n_params = len(names) - int(direct_bulk)
-    circuit_text = "(Rb|Qb) + (Ri|Qi) + W" if direct_bulk else ecm_circuit_string(n_arcs, warburg)
-    data_filename.seek(0)
-    mpr = BioLogic.MPRfile(data_filename)
-    df_raw = pd.DataFrame(mpr.data)
-    cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
-    summary_rows = []
-    param_rows = []
-    cycle_images = []
-    previous = None
-    for i, c in enumerate(cycle_nums):
-        if progress is not None:
-            progress(i, len(cycle_nums), int(c))
-        df_cycle = df_raw[df_raw["cycle number"] == c].reset_index(drop=True)
-        x_all = df_cycle["Re(Z)/Ohm"].values.astype(float)
-        y_all = df_cycle["-Im(Z)/Ohm"].values.astype(float)
-        f_all = df_cycle["freq/Hz"].values.astype(float)
-        valid = np.isfinite(f_all) & (f_all > 0) & np.isfinite(x_all) & np.isfinite(y_all) & (np.hypot(x_all, y_all) > 0)
-        positive = valid if direct_bulk else valid & (y_all > 0)
-        is_tail = np.zeros(len(y_all), dtype=bool)
-        if remove_tail and not warburg:
-            is_tail[positive] = find_diffusion_tail(f_all[positive], y_all[positive])
-        keep = positive & ~is_tail
-        f = f_all[keep]
-        Z = x_all[keep] - 1j * y_all[keep]
-        summary = {"Cycle": int(c)}
-        info = {
-            "Cycle": int(c),
-            "Fit converged": False,
-            "Points fitted": int(keep.sum()),
-            "Tail points removed": int(is_tail.sum()),
-        }
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.scatter(
-            x_all[~positive], y_all[~positive], color="lightgray", alpha=0.5, s=10
-        )
-        if is_tail.any():
-            ax.scatter(
-                x_all[is_tail],
-                y_all[is_tail],
-                facecolors="none",
-                edgecolors="gray",
-                s=14,
-                label="Diffusion tail (not fitted)",
-            )
-        ax.scatter(Z.real, -Z.imag, color="darkblue", s=10)
-
-        fit = None
-        resistance_entry = None
-        # Each point gives two residuals (real and imaginary).
-        enough_points = 2 * len(f) > n_params + 4
-        if enough_points:
-            try:
-                fit = fit_ecm_spectrum(f, Z, circuit_label, previous)
-            except RuntimeError:
-                fit = None
-        if fit is None:
-            note = "too few points" if not enough_points else "fit failed"
-            summary.update(
-                {"R_bulk": np.nan, "R_i": np.nan, "R_total": np.nan, "Fit error (%)": np.nan}
-            )
-            info.update({"Fit error (%)": np.nan, "Fit note": note})
-            ax.plot([], [], " ", label=note)
-        else:
-            previous = fit["fit_params"]
-            p = fit["params"]
-            se = fit["conf"]
-            r1, r2, q2, n2 = p[:4]
-            if n_arcs == 2:
-                r3, q3, n3 = p[4:7]
-                se_r3 = se[4]
-            else:
-                r3 = q3 = n3 = np.nan
-                se_r3 = 0.0
-            a_w = p[-1] if warburg else np.nan
-            r3_sum = r3 if n_arcs == 2 else 0.0
-            c2 = ecm_effective_capacitance(r2, q2, n2)
-            c3 = ecm_effective_capacitance(r3, q3, n3) if n_arcs == 2 else np.nan
-            bulk_arc = True if direct_bulk else bool(c2 < bulk_c_threshold)
-            # The standard errors use the same formula as impedance.py.
-            if bulk_arc:
-                r_bulk, r_i = r1 + r2, r3_sum
-                se_rb = np.sqrt(se[0] ** 2 + se[1] ** 2)
-                se_ri = se_r3
-            else:
-                r_bulk, r_i = r1, r2 + r3_sum
-                se_rb = se[0]
-                se_ri = np.sqrt(se[1] ** 2 + se_r3**2)
-            r_total = r1 + r2 + r3_sum
-            fit_error = 100 * np.sqrt(
-                np.mean(np.abs(Z - fit["predict"](f)) ** 2 / np.abs(Z) ** 2)
-            )
-
-            notes = list(fit.get("notes", []))
-            if n_arcs == 2:
-                f2 = ecm_arc_frequency(r2, q2, n2)
-                f3 = ecm_arc_frequency(r3, q3, n3)
-                if np.isfinite(f2) and np.isfinite(f3) and f2 / f3 < 10:
-                    notes.append("arcs overlap")
-                if min(r2, r3) < 1e-6 or min(n2, n3) <= 0.31:
-                    notes.append("arc collapsed")
-            elif bulk_arc:
-                notes.append("no interface arc")
-
-            summary.update(
-                {
-                    "R_bulk": r_bulk,
-                    "R_i": r_i,
-                    "R_total": r_total,
-                    "Fit error (%)": fit_error,
-                }
-            )
-            info.update(
-                {
-                    "Fit converged": fit["success"],
-                    "Fit error (%)": fit_error,
-                    "Fit note": ", ".join(notes),
-                }
-            )
-            info.update(fit.get("diagnostics", {}))
-            first = int(direct_bulk)
-            for (name, unit), value, error, start in zip(
-                names[first:], p[first:], se[first:], fit["initial"][first:]
-            ):
-                info[f"{name} ({unit})"] = value
-                info[f"{name} std. error ({unit})"] = error
-                info[f"{name} initial guess ({unit})"] = start
-            info["R_bulk std. error (Ohm)"] = se_rb
-            info["R_i std. error (Ohm)"] = se_ri
-            info["C_eff,bulk (F)" if direct_bulk else "C_eff,2 (F)"] = c2
-            if n_arcs == 2:
-                info["C_eff,interface (F)" if direct_bulk else "C_eff,3 (F)"] = c3
-
-            f_line = np.logspace(np.log10(f.min()), np.log10(f.max()), 500)
-            z_line = fit["predict"](f_line)
-            f_wide = np.logspace(-3, 9, 800)
-            z_arc2 = r1 + ecm_rq_impedance(f_wide, r2, q2, n2)
-            ax.plot(z_arc2.real, -z_arc2.imag, "--", color="gray", lw=1)
-            if n_arcs == 2:
-                z_arc3 = r1 + r2 + ecm_rq_impedance(f_wide, r3, q3, n3)
-                ax.plot(z_arc3.real, -z_arc3.imag, "--", color="gray", lw=1)
-            if warburg:
-                omega = 2 * np.pi * f_line
-                z_w = r_total + a_w * (1 - 1j) / np.sqrt(omega)
-                ax.plot(z_w.real, -z_w.imag, ":", color="gray", lw=1)
-
-            unit_text = {
-                "Ohm": "Ω",
-                "Ohm^-1 s^n": r"$\Omega^{-1}\,s^{n}$",
-                "-": "",
-                "Ohm s^-1/2": r"$\Omega\,s^{-1/2}$",
-            }
-            lines = [
-                f"{name} = {value:.4g} {unit_text[unit]}".rstrip()
-                for (name, unit), value in zip(names[first:], p[first:])
-            ]
-            lines.append(f"Fit error = {fit_error:.2f}%")
-            ax.plot(z_line.real, -z_line.imag, "r-", label="\n".join(lines))
-            if not direct_bulk:
-                (resistance_entry,) = ax.plot(
-                    [], [], " ",
-                    label=f"$R_{{bulk}}$ = {r_bulk:.4g} Ω\n$R_i$ = {r_i:.4g} Ω",
-                )
-
-        x_min, x_max = x_all.min(), x_all.max()
-        y_max = max(y_all.max(), 0)
-        pad = 0.05 * max(x_max - x_min, y_max, 1e-6)
-        ax.set_xlim(x_min - pad, x_max + pad)
-        ax.set_ylim(min(y_all.min(), 0) - pad, y_max + pad)
-        ax.set_title(
-            cycle_title
-            if cycle_title is not None
-            else f"{cell_label} {run_label} Cycle {int(c)}"
-        )
-        ax.set_xlabel("Re(Z)/Ohm")
-        ax.set_ylabel("-Im(Z)/Ohm")
-        ax.set_aspect("equal")
-        # Show R_bulk and R_i first, directly below the circuit string.
-        handles, labels = ax.get_legend_handles_labels()
-        if resistance_entry is not None:
-            first = handles.index(resistance_entry)
-            handles.insert(0, handles.pop(first))
-            labels.insert(0, labels.pop(first))
-        ax.legend(
-            handles,
-            labels,
-            loc="upper left",
-            bbox_to_anchor=(1.05, 1),
-            title=f"ECM: {circuit_text}",
-            fontsize="small",
-        )
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
-        cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
-        plt.close(fig)
-        summary_rows.append(summary)
-        param_rows.append(info)
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(by="Cycle")
-    params_df = pd.DataFrame(param_rows).sort_values(by="Cycle")
-    sum_buf, _ = plot_resistance_trend(summary_df, cell_label, run_label)
-    csv_buf = io.StringIO()
-    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
-    csv_buf.seek(0)
-    return summary_df, params_df, sum_buf, csv_buf, cycle_images
-
-
 def plot_cp_ewe(
     f_obj: IO[bytes], cell_label: str, density: float
 ) -> tuple[io.BytesIO, pd.DataFrame]:
@@ -1119,77 +273,6 @@ def plot_cp_ewe(
     return buf, df_norm
 
 
-def impedance_fit(
-    settings: dict[str, Any],
-    cell_type: str,
-    cell_label: str,
-    data_filename: IO[bytes],
-    run_label: str,
-    cycle_title: Optional[str] = None,
-    progress: Optional[Callable[[int, int, int], None]] = None,
-) -> tuple[
-    pd.DataFrame,
-    Optional[pd.DataFrame],
-    io.BytesIO,
-    io.StringIO,
-    list[tuple[str, io.BytesIO]],
-]:
-    """Fit each PEIS cycle with the technique in the settings.
-
-    Call ecm_fit for "ECM fit". Call semiellipse_fit for the other
-    techniques.
-
-    Args:
-        settings: The fit settings. The keys are "technique",
-            "discard_left", "discard_right", "fit_choice",
-            "ecm_circuit", "ecm_remove_tail", and "bulk_c_threshold".
-        cell_type: The type of analysis, for example "Preconditioning".
-        cell_label: The label of the cell under test.
-        data_filename: An MPR file object that contains PEIS data.
-        run_label: The label for this run, for example "Positive".
-        cycle_title: The title for each cycle plot. If None, use the
-            cell label, the run label, and the cycle number.
-        progress: A function that the fit calls before each cycle. See
-            ecm_fit.
-
-    Returns:
-        A tuple with the summary dataframe, the fit parameter dataframe
-        (None for the semi-ellipse fit), the trend plot buffer, the
-        summary CSV buffer, and a list of (file name, image buffer)
-        pairs for each cycle. See ecm_fit. The summary CSV has units in
-        the column names.
-    """
-    if settings["technique"] == "ECM fit":
-        return ecm_fit(
-            cell_type,
-            cell_label,
-            data_filename,
-            run_label,
-            settings["ecm_circuit"],
-            settings["bulk_c_threshold"],
-            remove_tail=bool(settings.get("ecm_remove_tail", True)),
-            cycle_title=cycle_title,
-            progress=progress,
-        )
-    summary_df, sum_buf, csv_buf, cycle_imgs = semiellipse_fit(
-        cell_type,
-        cell_label,
-        settings["discard_left"],
-        settings["discard_right"],
-        data_filename,
-        run_label,
-        settings["fit_choice"] == "Two Ellipse (Recommended)",
-        settings["fit_choice"] == "Single Ellipse",
-        cycle_title=cycle_title,
-        progress=progress,
-    )
-    # Write the summary CSV with units in the column names.
-    csv_buf = io.StringIO()
-    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv_buf, index=False)
-    csv_buf.seek(0)
-    return summary_df, None, sum_buf, csv_buf, cycle_imgs
-
-
 def plot_limiting_peis_fit(
     f_peis: IO[bytes],
     cell_label: str,
@@ -1212,7 +295,7 @@ def plot_limiting_peis_fit(
     Returns:
         The first cycle image buffer, or None if no cycle exists. Also
         return the summary dataframe, the fit parameter dataframe (None
-        for the semi-ellipse fit), and the summary CSV buffer.
+        if fitting fails), and the summary CSV buffer.
     """
     summary_df, params_df, sum_buf, csv_buf, cycle_imgs = impedance_fit(
         settings,
@@ -2249,3 +1332,111 @@ def plot_sands_analysis(
     buf.seek(0)
     plt.close(fig)
     return buf, i_opt
+
+
+def fit_ecm_spectrum(f, Z, circuit_label=ECM_BULK_INTERFACE, previous=None):
+    """Fit the only supported circuit, without a previous-cycle warm start."""
+    if circuit_label != ECM_BULK_INTERFACE:
+        raise ValueError(f'This branch supports only {ECM_BULK_INTERFACE}.')
+    return fit_spectrum(f, Z)
+
+
+def ecm_fit(cell_type, cell_label, data_filename, run_label,
+            circuit_label=ECM_BULK_INTERFACE, bulk_c_threshold=None,
+            remove_tail=False, cycle_title=None, progress=None):
+    """Fit all valid points of each PEIS cycle with two R-CPE arcs and Qt.
+
+    Return summary, full parameter/diagnostic table, resistance-trend image,
+    summary CSV, and cycle images. The plot shows only fitted values and error.
+    R_bulk/R_i are nominal branch assignments; no capacitance cutoff is applied.
+    """
+    if circuit_label != ECM_BULK_INTERFACE:
+        raise ValueError(f'This branch supports only {ECM_BULK_INTERFACE}.')
+    if bulk_c_threshold is not None or remove_tail:
+        raise ValueError('The Qt circuit fits the whole spectrum without a capacitance cutoff.')
+    data_filename.seek(0)
+    df_raw = pd.DataFrame(BioLogic.MPRfile(data_filename).data)
+    cycles = sorted(df_raw['cycle number'].unique())
+    summary_rows, param_rows, cycle_images = [], [], []
+    for index, cycle in enumerate(cycles):
+        if progress is not None:
+            progress(index, len(cycles), int(cycle))
+        df = df_raw[df_raw['cycle number'] == cycle]
+        f_all = df['freq/Hz'].to_numpy(dtype=float)
+        x_all = df['Re(Z)/Ohm'].to_numpy(dtype=float)
+        y_all = df['-Im(Z)/Ohm'].to_numpy(dtype=float)
+        valid = (np.isfinite(f_all) & (f_all > 0) & np.isfinite(x_all)
+                 & np.isfinite(y_all) & (np.hypot(x_all, y_all) > 0))
+        f, z = f_all[valid], x_all[valid]-1j*y_all[valid]
+        info = {'Cycle': int(cycle), 'Fit converged': False,
+                'Points fitted': int(valid.sum()), 'Tail points removed': 0,
+                'Circuit': ECM_BULK_INTERFACE}
+        summary = {'Cycle': int(cycle)}
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.scatter(x_all, y_all, color='lightgray', s=10)
+        ax.scatter(z.real, -z.imag, color='darkblue', s=10)
+        try:
+            fit = fit_ecm_spectrum(f, z, circuit_label)
+        except RuntimeError as exc:
+            summary.update(R_bulk=np.nan, R_i=np.nan, R_total=np.nan)
+            summary['Fit error (%)'] = np.nan
+            info.update({'Fit error (%)': np.nan, 'Fit note': str(exc)})
+            ax.plot([], [], ' ', label='Fit unavailable')
+        else:
+            p = fit['params']
+            rb, qb, nb, ri, qi, ni, qt, nt = p
+            error = 100*np.sqrt(np.mean(abs((fit['predict'](f)-z)/abs(z))**2))
+            summary.update(R_bulk=rb, R_i=ri, R_total=rb+ri)
+            summary['Fit error (%)'] = error
+            info.update({'Fit converged': True, 'Fit error (%)': error,
+                         'Fit note': '; '.join(fit['notes'])})
+            info.update(fit['diagnostics'])
+            for name, unit, value, se, initial in zip(
+                    PARAMETER_NAMES, PARAMETER_UNITS, p, fit['conf'], fit['initial']):
+                info[f'{name} ({unit})'] = value
+                info[f'{name} std. error ({unit})'] = se
+                info[f'{name} initial guess ({unit})'] = initial
+            info['R_bulk std. error (Ohm)'] = fit['conf'][0]
+            info['R_i std. error (Ohm)'] = fit['conf'][3]
+            info['C_eff,bulk (F)'] = ecm_effective_capacitance(rb, qb, nb)
+            info['C_eff,interface (F)'] = ecm_effective_capacitance(ri, qi, ni)
+            frequencies = np.geomspace(f.max(), f.min(), 500)
+            prediction = fit['predict'](frequencies)
+            units = {'Ohm': 'Ω', 'Ohm^-1 s^n': r'$\Omega^{-1}\,s^{n}$', '-': ''}
+            label = '\n'.join(f'{name} = {value:.4g} {units[unit]}'.rstrip()
+                              for name, unit, value in zip(PARAMETER_NAMES, PARAMETER_UNITS, p))
+            ax.plot(prediction.real, -prediction.imag, 'r-',
+                    label=label+f'\nFit error = {error:.2f}%')
+        finite = np.isfinite(x_all) & np.isfinite(y_all)
+        if finite.any():
+            x, y = x_all[finite], y_all[finite]
+            pad = .05*max(float(np.ptp(x)), float(np.ptp(y)), 1e-6)
+            ax.set_xlim(x.min()-pad, x.max()+pad)
+            ax.set_ylim(min(y.min(), 0)-pad, max(y.max(), 0)+pad)
+        ax.set_title(cycle_title or f'{cell_label} {run_label} Cycle {int(cycle)}')
+        ax.set_xlabel('Re(Z)/Ohm'); ax.set_ylabel('-Im(Z)/Ohm')
+        ax.set_aspect('equal')
+        ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1),
+                  title=f'ECM: {ECM_BULK_INTERFACE}', fontsize='small')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight'); buf.seek(0)
+        plt.close(fig)
+        cycle_images.append((f'{cell_label}_{run_label}_Cycle_{int(cycle)}_Fit.png', buf))
+        summary_rows.append(summary); param_rows.append(info)
+    summary_df = pd.DataFrame(summary_rows).sort_values('Cycle')
+    params_df = pd.DataFrame(param_rows).sort_values('Cycle')
+    trend, _ = plot_resistance_trend(summary_df, cell_label, run_label)
+    csv = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv, index=False); csv.seek(0)
+    return summary_df, params_df, trend, csv, cycle_images
+
+
+def impedance_fit(settings, cell_type, cell_label, data_filename, run_label,
+                  cycle_title=None, progress=None):
+    """Route every EIS workflow to the sole supported Qt circuit."""
+    if settings.get('technique') != 'ECM fit':
+        raise ValueError('Only the Qt equivalent circuit is available in this branch.')
+    return ecm_fit(cell_type, cell_label, data_filename, run_label,
+        settings['ecm_circuit'], settings.get('bulk_c_threshold'),
+        remove_tail=bool(settings.get('ecm_remove_tail', False)),
+        cycle_title=cycle_title, progress=progress)
