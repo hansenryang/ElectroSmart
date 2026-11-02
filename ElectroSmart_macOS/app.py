@@ -503,10 +503,9 @@ def build_metadata_text(
 def current_metadata_text(meta_key: str) -> str:
     """Complete the stored metadata text with the state of the page.
 
-    Start with the text that the analysis stored. Put the names of all
-    uploaded MPR files after the header, before the first section. Add
-    each warning and error that the page shows in this run, above the
-    download button, at the end.
+    Start with the text that the analysis stored. Add the names of all
+    uploaded MPR files. Add each warning and error that the page shows
+    in this run, above the download button.
 
     Args:
         meta_key: The session state key that holds the metadata text.
@@ -514,25 +513,19 @@ def current_metadata_text(meta_key: str) -> str:
     Returns:
         The full metadata text, with CRLF line endings.
     """
-    uploaded = ["", "All Uploaded .mpr Files", "-----------------------"]
-    uploaded += st.session_state.get("run_uploaded_names", []) or ["None"]
+    lines = ["", "All Uploaded .mpr Files", "-----------------------"]
+    lines += st.session_state.get("run_uploaded_names", []) or ["None"]
 
     title = "Warnings Shown at Download"
-    warnings = ["", title, "-" * len(title)]
+    lines += ["", title, "-" * len(title)]
     messages = st.session_state.get("run_messages", [])
     if not messages:
-        warnings.append("None")
+        lines.append("None")
     for number, message in enumerate(messages, start=1):
         parts = [p.strip() for p in message.splitlines() if p.strip()]
-        warnings.append(f"{number}. {parts[0]}")
-        warnings += [f"   {p}" for p in parts[1:]]
-
-    # The header has no blank line. A blank line starts each section.
-    header, _, sections = st.session_state[meta_key].partition("\r\n\r\n")
-    text = header.rstrip("\r\n") + "\r\n" + "\r\n".join(uploaded) + "\r\n"
-    if sections:
-        text += "\r\n" + sections
-    return text + "\r\n".join(warnings) + "\r\n"
+        lines.append(f"{number}. {parts[0]}")
+        lines += [f"   {p}" for p in parts[1:]]
+    return st.session_state[meta_key] + "\r\n".join(lines) + "\r\n"
 
 
 def add_metadata_to_zip(zip_bytes: bytes, file_name: str, meta_key: str) -> bytes:
