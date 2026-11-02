@@ -4,6 +4,19 @@ The only EIS fitting circuit is **(Rb ∥ Qb) + (Ri ∥ Qi) + Qt**.
 
 The eight fitted parameters are **Rb, Qb, nb, Ri, Qi, ni, Qt, nt**. Each parallel branch uses R / [1 + R Q (jω)^n]; the series tail uses 1 / [Qt (jω)^nt]. There is no fitted series resistor or Warburg element.
 
+| Symbol | Meaning | Unit |
+|---|---|---|
+| Rb | Resistance of the branch assigned to bulk electrolyte | Ω |
+| Qb | CPE coefficient of the bulk branch | Ω⁻¹ sⁿᵇ |
+| nb | Exponent describing the bulk CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Ri | Resistance of the branch assigned to the interface | Ω |
+| Qi | CPE coefficient of the interface branch | Ω⁻¹ sⁿⁱ |
+| ni | Exponent describing the interface CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Qt | CPE coefficient used to describe the low-frequency tail | Ω⁻¹ sⁿᵗ |
+| nt | Exponent controlling the tail’s frequency dependence and angle | Dimensionless |
+| ∥ | Elements connected in parallel | — |
+| + | Elements connected in series | — |
+
 ## Run
 
 - macOS: open `ElectroSmart_macOS/ElectroSmart_v4_macOS.command`.
