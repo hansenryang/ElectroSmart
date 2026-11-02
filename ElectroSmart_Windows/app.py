@@ -482,11 +482,11 @@ def build_metadata_text(
         current_metadata_text adds the uploaded files and the warnings
         at download.
     """
-    title = "ElectroSmart Analysis Metadata"
+    title = "Zirong-ECM Analysis Metadata"
     lines = [
         title,
         "=" * len(title),
-        f"ElectroSmart Version: {version}",
+        f"Zirong-ECM Version: {version}",
         f"Analysis: {analysis}",
         f"Time of Analysis: {analysis_time_text()}",
         f"Cell Type: {cell_type}",
@@ -913,12 +913,12 @@ def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
 
 # --- Main App ---
 st.set_page_config(
-    page_title="ElectroSmart",
+    page_title="Zirong-ECM",
     page_icon=icon,
     layout="wide",
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
-        "About": (f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
+        "About": (f"Zirong-ECM v{version} — based on ElectroSmart, Balsara Lab, UC Berkeley\n\n"
                   "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
                   "**Acknowledgements & Credits:** \n - If this software contributes to any " 
                   "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
@@ -1020,7 +1020,7 @@ st.markdown(
     f"""
     <div style="display:flex; align-items:flex-end; gap:12px;">
         <img src="data:image/png;base64,{logo_b64}" style="height:48px; margin-bottom:4px;">
-        <h1 style="margin:0; padding:0;">ElectroSmart</h1>
+        <h1 style="margin:0; padding:0;">Zirong-ECM</h1>
     </div>
     """,
     unsafe_allow_html=True,

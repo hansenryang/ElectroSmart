@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -e
 cd "$(dirname "$0")"
-echo "ElectroSmart Qt-only · (Rb | Qb) + (Ri | Qi) + Qt"
+echo "Zirong-ECM · (Rb | Qb) + (Ri | Qi) + Qt"
 PORT="${ELECTROSMART_PORT:-8502}"
 REUSE_PY="$PWD/../../ElectroSmart-try-ECM-fitting/ElectroSmart_macOS/ElectroSmartEnv/bin/python"
 if [ -x "$PWD/ElectroSmartEnv/bin/python" ]; then

@@ -1,4 +1,4 @@
-# ElectroSmart — Qt-only branch
+# Zirong-ECM
 
 The only EIS fitting circuit is **(Rb ∥ Qb) + (Ri ∥ Qi) + Qt**.
 
@@ -25,7 +25,7 @@ The higher-frequency branch is labelled Rb/Qb/nb by convention. R_bulk = Rb and 
 
 This is a separate local repository made from the user's modified ElectroSmart download. `main` contains the pre-change snapshot; `feature/qt-only-fitting` contains this edition. No remote is configured or published. The original downloaded app remains separate.
 
-macOS and Windows Python sources are identical. The numerical and macOS/Streamlit checks are described in VALIDATION.md; Windows launcher execution requires Windows.
+macOS and Windows Python sources are identical. The folder contains the app and its supporting files; no test datasets or test suite are included. Numerical checks and the macOS app were verified on PEO and PPM data before packaging.
 
 ## Credits
 

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo ElectroSmart Qt-only
+echo Zirong-ECM
 if not defined ELECTROSMART_PORT set "ELECTROSMART_PORT=8502"
 if not exist "ElectroSmartEnv\Scripts\python.exe" (
     python -m venv ElectroSmartEnv
