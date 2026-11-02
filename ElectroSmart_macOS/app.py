@@ -47,6 +47,7 @@ with open(logo_path, "rb") as f:
 def impedance_fit_label(key: str) -> str:
     """Show the fixed circuit used in every EIS workflow."""
     st.markdown('**Circuit: (Rb ∥ Qb) + (Ri ∥ Qi) + Qt**')
+    st.image(os.path.join(os.path.dirname(__file__), 'circuit_qt.svg'), width='stretch')
     return 'ECM fit'
 
 
