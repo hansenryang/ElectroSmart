@@ -1,22 +1,3 @@
-# Zirong-ECM
-
-The only EIS fitting circuit is **(Rb ∥ Qb) + (Ri ∥ Qi) + Qt**.
-
-The eight fitted parameters are **Rb, Qb, nb, Ri, Qi, ni, Qt, nt**. Each parallel branch uses R / [1 + R Q (jω)^n]; the series tail uses 1 / [Qt (jω)^nt]. There is no fitted series resistor or Warburg element.
-
-| Symbol | Meaning | Unit |
-|---|---|---|
-| Rb | Resistance of the branch assigned to bulk electrolyte | Ω |
-| Qb | CPE coefficient of the bulk branch | Ω⁻¹ sⁿᵇ |
-| nb | Exponent describing the bulk CPE’s departure from ideal capacitive behaviour | Dimensionless |
-| Ri | Resistance of the branch assigned to the interface | Ω |
-| Qi | CPE coefficient of the interface branch | Ω⁻¹ sⁿⁱ |
-| ni | Exponent describing the interface CPE’s departure from ideal capacitive behaviour | Dimensionless |
-| Qt | CPE coefficient used to describe the low-frequency tail | Ω⁻¹ sⁿᵗ |
-| nt | Exponent controlling the tail’s frequency dependence and angle | Dimensionless |
-| ∥ | Elements connected in parallel | — |
-| + | Elements connected in series | — |
-
 ## Run
 
 - macOS: open `ElectroSmart_macOS/ElectroSmart_v4_macOS.command`.
@@ -57,9 +38,30 @@ An interface/app for data analysis work in the Balsara Lab.
 
 Author: Hansen Yang, Zirong He<br>
 Last updated: October 9, 2026<br>
-Version: 4.5 (v4.5)<br>
+Version: 4.6 (v4.6)<br>
 Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.<br>
 Properties: This app is run locally on your computer, or on the Streamlit website. It is displayed in your default browser.
+
+## Changes in v4.6
+A genral fitting stradegy based on equivalent circuit method (ECM):
+
+ **(Rb ∥ Qb) + (Ri ∥ Qi) + Qt**.
+
+The eight fitted parameters are **Rb, Qb, nb, Ri, Qi, ni, Qt, nt**. Each parallel branch uses R / [1 + R Q (jω)^n]; the series tail uses 1 / [Qt (jω)^nt]. It uses SciPy’s least_squares optimizer.
+
+| Symbol | Meaning | Unit |
+|---|---|---|
+| Rb | Resistance of the branch assigned to bulk electrolyte | Ω |
+| Qb | CPE coefficient of the bulk branch | Ω⁻¹ sⁿᵇ |
+| nb | Exponent describing the bulk CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Ri | Resistance of the branch assigned to the interface | Ω |
+| Qi | CPE coefficient of the interface branch | Ω⁻¹ sⁿⁱ |
+| ni | Exponent describing the interface CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Qt | CPE coefficient used to describe the low-frequency tail | Ω⁻¹ sⁿᵗ |
+| nt | Exponent controlling the tail’s frequency dependence and angle | Dimensionless |
+| ∥ | Elements connected in parallel | — |
+| + | Elements connected in series | — |
+
 
 ## Changes in v4.5
 
