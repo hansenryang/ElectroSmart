@@ -6,7 +6,22 @@ from galvani import BioLogic
 from scipy.optimize import fsolve, fmin, curve_fit
 from scipy.signal import find_peaks, savgol_filter
 import re
-from typing import Any, IO, Optional, Union
+from typing import Any, Callable, IO, Optional, Union
+
+# The sole EIS circuit for this branch. Q coefficients use CPE units.
+from qt_circuit import CIRCUIT as ECM_BULK_INTERFACE
+from qt_circuit import PARAMETER_NAMES, PARAMETER_UNITS, fit_spectrum
+
+# The column names with units for the summary tables of both fits. The
+# analyses calculate with the names without units.
+SUMMARY_UNITS = {
+    "R_bulk": "R_bulk (Ohm)",
+    "R_i": "R_i (Ohm)",
+    "R_total": "R_total (Ohm)",
+    "R_bulk + R_i": "R_bulk + R_i (Ohm)",
+    "R_bulk_arc": "R_bulk_arc (Ohm)",
+    "R_i_arc": "R_i_arc (Ohm)",
+}
 
 # Global style updates
 plt.rcParams.update(
@@ -132,260 +147,20 @@ def plot_all_CP_LC(
     return cp_plot_buf
 
 
-def semi_ellipse(
-    x: np.ndarray, xc: float, yc: float, Rx: float, Ry: float
-) -> np.ndarray:
-    """Compute the upper half of an ellipse at each x value.
+def plot_resistance_trend(
+    summary_df: pd.DataFrame, cell_label: str, run_label: str
+) -> tuple[io.BytesIO, io.StringIO]:
+    """Plot R_bulk and R_i against the cycle number.
 
     Args:
-        x: The x values to evaluate.
-        xc: The x coordinate of the ellipse center.
-        yc: The y coordinate of the ellipse center.
-        Rx: The x radius of the ellipse.
-        Ry: The y radius of the ellipse.
-
-    Returns:
-        The y values on the upper half of the ellipse.
-    """
-    z = (x - xc) / Rx
-    return yc + Ry * np.sqrt(np.maximum(1 - z**2, 0))
-
-
-def solve_ellipse_xints(
-    xc: float, yc: float, Rx: float, Ry: float
-) -> tuple[float, float]:
-    """Find the left and right x-intercepts of an ellipse at y = 0.
-
-    Args:
-        xc: The x coordinate of the ellipse center.
-        yc: The y coordinate of the ellipse center.
-        Rx: The x radius of the ellipse.
-        Ry: The y radius of the ellipse.
-
-    Returns:
-        The left x-intercept and the right x-intercept.
-    """
-    term = np.sqrt(abs(1 - (yc / Ry) ** 2))
-    return xc - Rx * term, xc + Rx * term
-
-
-def obj_one_ellipse(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
-    """Compute the sum of squared errors for a one-ellipse fit.
-
-    Reject invalid radii with a large penalty value.
-
-    Args:
-        params: The fit parameters xc, yc, Rx, Ry.
-        x: The measured x values.
-        y: The measured y values.
-
-    Returns:
-        The sum of squared errors, or 1e12 for invalid radii.
-    """
-    xc, yc, Rx, Ry = params
-    if Rx <= 0 or Ry <= 0:
-        return 1e12
-    return np.sum((y - semi_ellipse(x, xc, yc, Rx, Ry)) ** 2)
-
-
-def obj_two_ellipses(params: list[float], x: np.ndarray, y: np.ndarray) -> float:
-    """Compute the sum of squared errors for a two-ellipse fit.
-
-    Take the upper envelope of the two ellipses at each x value. Reject
-    invalid radii with a large penalty value.
-
-    Args:
-        params: The fit parameters for both ellipses.
-        x: The measured x values.
-        y: The measured y values.
-
-    Returns:
-        The sum of squared errors, or 1e12 for invalid radii.
-    """
-    xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = params
-    if any(p <= 0 for p in [Rx1, Ry1, Rx2, Ry2]):
-        return 1e12
-    y1 = semi_ellipse(x, xc1, yc1, Rx1, Ry1)
-    y2 = semi_ellipse(x, xc2, yc2, Rx2, Ry2)
-    return np.sum((y - np.maximum(y1, y2)) ** 2)
-
-
-def calculate_bic(rss: float, n: int, k: int) -> float:
-    """Calculate the Bayesian Information Criterion for a fit.
-
-    Args:
-        rss: The residual sum of squares from the fit.
-        n: The number of data points.
-        k: The number of free parameters in the fit.
-
-    Returns:
-        The BIC value. Return 1e12 if rss is not positive.
-    """
-    if rss <= 0:
-        return 1e12
-    return n * np.log(rss / n) + k * np.log(n)
-
-
-def find_both_mins(df: pd.DataFrame, peak_idx: int) -> tuple[int, int]:
-    """Find the left and right local minimum points around a peak.
-
-    Search left from the peak for the lowest point. Search right from
-    the peak for the lowest point.
-
-    Args:
-        df: A dataframe with the imaginary impedance in column 1.
-        peak_idx: The row index of the peak.
-
-    Returns:
-        The row index of the left minimum and the row index of the
-        right minimum.
-    """
-    Im_Z = df.iloc[:, 1].values
-    n_rows = len(Im_Z)
-    left_min_idx = 0
-    left_min_val = Im_Z[0]
-    for i in range(peak_idx):
-        if Im_Z[i] < left_min_val:
-            left_min_val = Im_Z[i]
-            left_min_idx = i
-    right_min_idx = peak_idx
-    right_min_val = Im_Z[peak_idx]
-    for i in range(peak_idx, n_rows):
-        if Im_Z[i] < right_min_val:
-            right_min_val = Im_Z[i]
-            right_min_idx = i
-    return left_min_idx, right_min_idx
-
-
-def semiellipse_fit(
-    cell_type: str,
-    cell_label: str,
-    no_left_idx_to_throw: int,
-    no_right_idx_to_throw: int,
-    data_filename: IO[bytes],
-    run_label: str,
-    must_use_dual: bool,
-    must_use_single: bool,
-    cycle_title: Optional[str] = None,
-) -> tuple[pd.DataFrame, io.BytesIO, io.StringIO, list[tuple[str, io.BytesIO]]]:
-    """Fit each PEIS cycle in an MPR file with one or two semi-ellipses.
-
-    For each cycle, trim points near the ends. Fit a single ellipse and
-    a two-ellipse model. Choose the model with the lower BIC score,
-    unless the caller forces one model. Compute R_bulk and R_i from the
-    fit. Plot each cycle fit and the trend across cycles.
-
-    Args:
-        cell_type: The type of analysis, for example "Preconditioning".
+        summary_df: A dataframe with the columns Cycle, R_bulk, and R_i.
         cell_label: The label of the cell under test.
-        no_left_idx_to_throw: The number of points to discard from the
-            left.
-        no_right_idx_to_throw: The number of points to discard from the
-            right.
-        data_filename: An MPR file object that contains PEIS data.
         run_label: The label for this run, for example "Positive".
-        must_use_dual: Force the two-ellipse model for every cycle.
-        must_use_single: Force the one-ellipse model for every cycle.
-        cycle_title: The title for each cycle plot. If None, use the
-            cell label, the run label, and the cycle number.
 
     Returns:
-        A tuple with the summary dataframe, the trend plot buffer, the
-        summary CSV buffer, and a list of (file name, image buffer)
-        pairs for each cycle.
+        A PNG image buffer of the trend plot, and a CSV buffer of the
+        summary dataframe.
     """
-    data_filename.seek(0)
-    mpr = BioLogic.MPRfile(data_filename)
-    df_raw = pd.DataFrame(mpr.data)
-    cycle_nums = sorted(list(set(df_raw["cycle number"].values)))
-    results_list = []
-    cycle_images = []
-    for i, c in enumerate(cycle_nums):
-        df_cycle = df_raw[df_raw["cycle number"] == c].reset_index(drop=True)
-        df_clean = df_cycle[["Re(Z)/Ohm", "-Im(Z)/Ohm"]]
-        no_rows = len(df_clean)
-        l_idx, r_idx = find_both_mins(df_clean, peak_idx=no_rows // 4)
-        if no_rows > 10:
-            l_idx += no_left_idx_to_throw
-            r_idx -= no_right_idx_to_throw
-        l_idx = max(0, l_idx)
-        r_idx = min(no_rows - 1, r_idx)
-        idx_list = range(l_idx, r_idx + 1)
-        df_masked = df_clean.iloc[idx_list, :]
-        x_fit = df_masked.iloc[:, 0].values
-        y_fit = df_masked.iloc[:, 1].values
-        n = len(x_fit)
-        start_val, end_val = x_fit[0], x_fit[-1]
-        res_one = fmin(
-            obj_one_ellipse,
-            [(start_val + end_val) / 2, 0, (end_val - start_val) / 2, np.max(y_fit)],
-            args=(x_fit, y_fit),
-            disp=False,
-        )
-        bic_one = calculate_bic(obj_one_ellipse(res_one, x_fit, y_fit), n, 4)
-        mid_x = (start_val + end_val) / 2
-        guess_two = [
-            (start_val + mid_x) / 2,
-            0,
-            (mid_x - start_val) / 2,
-            np.max(y_fit) * 0.5,
-            (mid_x + end_val) / 2,
-            0,
-            (end_val - mid_x) / 2,
-            np.max(y_fit),
-        ]
-        res_two = fmin(
-            obj_two_ellipses, guess_two, args=(x_fit, y_fit), disp=False, maxiter=2000
-        )
-        bic_two = calculate_bic(obj_two_ellipses(res_two, x_fit, y_fit), n, 8)
-        use_dual = (bic_two < bic_one or must_use_dual) and not must_use_single
-        if use_dual:
-            xc1, yc1, Rx1, Ry1, xc2, yc2, Rx2, Ry2 = res_two
-            l1, r1 = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            l2, r2 = solve_ellipse_xints(xc2, yc2, Rx2, Ry2)
-            r_bulk_raw = l1 if abs(l1 - start_val) <= abs(l2 - start_val) else l2
-            r_total_raw = r1 if abs(r1 - end_val) <= abs(r2 - end_val) else r2
-        else:
-            xc1, yc1, Rx1, Ry1 = res_one
-            r_bulk_raw, r_total_raw = solve_ellipse_xints(xc1, yc1, Rx1, Ry1)
-            xc2 = yc2 = Rx2 = Ry2 = np.nan
-        r_bulk = r_bulk_raw if r_bulk_raw >= 0 else x_fit[0]
-        ri = r_total_raw - r_bulk
-        fig_ind = plt.figure(figsize=(8, 4))
-        plt.scatter(
-            df_clean.iloc[:, 0], df_clean.iloc[:, 1], color="lightgray", alpha=0.3
-        )
-        plt.scatter(x_fit, y_fit, color="darkblue", s=10)
-        x_plot = np.linspace(r_bulk, r_total_raw, 500)
-        y_p = (
-            np.maximum(
-                semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1),
-                semi_ellipse(x_plot, xc2, yc2, Rx2, Ry2),
-            )
-            if use_dual
-            else semi_ellipse(x_plot, xc1, yc1, Rx1, Ry1)
-        )
-        lbl = f"$R_{{bulk}}$: {r_bulk:.1f} Ω\n$R_i$: {ri:.1f} Ω"
-        plt.plot(x_plot, y_p, "r-", label=lbl)
-        plt.title(
-            cycle_title
-            if cycle_title is not None
-            else f"{cell_label} {run_label} Cycle {int(c)}"
-        )
-        plt.xlabel("Re(Z)/Ohm")
-        plt.ylabel("-Im(Z)/Ohm")
-        plt.gca().set_aspect("equal")
-        plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1))
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
-        cycle_images.append((f"{cell_label}_{run_label}_Cycle_{int(c)}_Fit.png", buf))
-        fig_ind.clear()
-        plt.close(fig_ind)
-        results_list.append(
-            {"Cycle": int(c), "R_bulk": r_bulk, "R_i": ri, "R_total": r_total_raw}
-        )
-    summary_df = pd.DataFrame(results_list).sort_values(by="Cycle")
     fig_sum, ax1 = plt.subplots(figsize=(10, 5))
     ax2 = ax1.twinx()
     ax1.plot(
@@ -410,7 +185,57 @@ def semiellipse_fit(
     csv_buf.seek(0)
     fig_sum.clear()
     plt.close(fig_sum)
-    return summary_df, sum_buf, csv_buf, cycle_images
+    return sum_buf, csv_buf
+
+
+def ecm_arc_frequency(r: float, q: float, n: float) -> float:
+    """Calculate the characteristic frequency of one R|Q arc.
+
+    Args:
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The frequency 1 / (2 pi (R Q)^(1/n)), in Hz. Return inf if R
+        is 0.
+    """
+    if r <= 1e-12:
+        return np.inf
+    return 1 / (2 * np.pi * (r * q) ** (1 / n))
+
+
+def ecm_effective_capacitance(r: float, q: float, n: float) -> float:
+    """Calculate the effective capacitance of one R|Q arc.
+
+    Use the peak-frequency equivalent capacitance C = (R Q)^(1/n) / R.
+
+    Args:
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The effective capacitance, in F. Return NaN if R is 0.
+    """
+    if r <= 1e-12:
+        return np.nan
+    return (r * q) ** (1 / n) / r
+
+
+def ecm_rq_impedance(f: np.ndarray, r: float, q: float, n: float) -> np.ndarray:
+    """Calculate the impedance of one R|Q arc.
+
+    Args:
+        f: The frequencies, in Hz.
+        r: The resistance, in Ohm.
+        q: The CPE parameter Q.
+        n: The CPE exponent.
+
+    Returns:
+        The complex impedance at each frequency, in Ohm.
+    """
+    return r / (1 + r * q * (2j * np.pi * f) ** n)
 
 
 def plot_cp_ewe(
@@ -452,40 +277,32 @@ def plot_limiting_peis_fit(
     f_peis: IO[bytes],
     cell_label: str,
     run_label: str,
-    discard_left: int,
-    discard_right: int,
-    must_use_dual: bool,
-    must_use_single: bool,
+    settings: dict[str, Any],
     density: Optional[float] = None,
-) -> tuple[Optional[io.BytesIO], pd.DataFrame, io.StringIO]:
+) -> tuple[Optional[io.BytesIO], pd.DataFrame, Optional[pd.DataFrame], io.StringIO]:
     """Fit the PEIS data for one Limiting Current run.
 
-    Call semiellipse_fit and return the first cycle image.
+    Call impedance_fit and return the first cycle image.
 
     Args:
         f_peis: An MPR file object that contains PEIS data.
         cell_label: The label of the cell under test.
         run_label: The label for this run, for example "Run 1".
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-        must_use_dual: Force the two-ellipse model for every cycle.
-        must_use_single: Force the one-ellipse model for every cycle.
+        settings: The fit settings. See impedance_fit.
         density: The applied current density, in mA/cm². Show it in the
             plot title in place of the run label and the cycle number.
 
     Returns:
         The first cycle image buffer, or None if no cycle exists. Also
-        return the summary dataframe and the summary CSV buffer.
+        return the summary dataframe, the fit parameter dataframe (None
+        if fitting fails), and the summary CSV buffer.
     """
-    summary_df, sum_buf, csv_buf, cycle_imgs = semiellipse_fit(
+    summary_df, params_df, sum_buf, csv_buf, cycle_imgs = impedance_fit(
+        settings,
         "Limiting",
         cell_label,
-        discard_left,
-        discard_right,
         f_peis,
         run_label,
-        must_use_dual,
-        must_use_single,
         cycle_title=(
             None
             if density is None
@@ -493,8 +310,8 @@ def plot_limiting_peis_fit(
         ),
     )
     if cycle_imgs:
-        return cycle_imgs[0][1], summary_df, csv_buf
-    return None, summary_df, csv_buf
+        return cycle_imgs[0][1], summary_df, params_df, csv_buf
+    return None, summary_df, params_df, csv_buf
 
 
 def is_diverging(
@@ -578,7 +395,8 @@ def is_diverging(
 
 
 def analyze_sand_and_polarization(
-    cp_results: list[tuple[pd.DataFrame, float]]
+    cp_results: list[tuple[pd.DataFrame, float]],
+    auto_detect_plateau: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Find the Sand's time and the steady-state polarization for each run.
 
@@ -589,6 +407,8 @@ def analyze_sand_and_polarization(
 
     Args:
         cp_results: A list of (dataframe, current density) pairs.
+        auto_detect_plateau: If True, record the steady-state voltage only
+            for the runs that do not diverge. If False, record it for all runs.
 
     Returns:
         A dataframe of Sand's times and a dataframe of steady-state
@@ -625,8 +445,11 @@ def analyze_sand_and_polarization(
         t_end_s = df["norm_time_h"].iloc[-1] * 3600
         df_final = df[(df["norm_time_h"] * 3600) >= (t_end_s - 120)]
 
-        if not df_final.empty and not is_diverging(
-            (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+        if not df_final.empty and not (
+            auto_detect_plateau
+            and is_diverging(
+                (df["norm_time_h"] * 3600).to_numpy(), v_abs.to_numpy()
+            )
         ):
             v_avg = df_final["Ewe/V"].mean()
             pols.append(
@@ -1509,3 +1332,111 @@ def plot_sands_analysis(
     buf.seek(0)
     plt.close(fig)
     return buf, i_opt
+
+
+def fit_ecm_spectrum(f, Z, circuit_label=ECM_BULK_INTERFACE, previous=None):
+    """Fit the only supported circuit, without a previous-cycle warm start."""
+    if circuit_label != ECM_BULK_INTERFACE:
+        raise ValueError(f'This branch supports only {ECM_BULK_INTERFACE}.')
+    return fit_spectrum(f, Z)
+
+
+def ecm_fit(cell_type, cell_label, data_filename, run_label,
+            circuit_label=ECM_BULK_INTERFACE, bulk_c_threshold=None,
+            remove_tail=False, cycle_title=None, progress=None):
+    """Fit all valid points of each PEIS cycle with two R-CPE arcs and Qt.
+
+    Return summary, full parameter/diagnostic table, resistance-trend image,
+    summary CSV, and cycle images. The plot shows only fitted values and error.
+    R_bulk/R_i are nominal branch assignments; no capacitance cutoff is applied.
+    """
+    if circuit_label != ECM_BULK_INTERFACE:
+        raise ValueError(f'This branch supports only {ECM_BULK_INTERFACE}.')
+    if bulk_c_threshold is not None or remove_tail:
+        raise ValueError('The Qt circuit fits the whole spectrum without a capacitance cutoff.')
+    data_filename.seek(0)
+    df_raw = pd.DataFrame(BioLogic.MPRfile(data_filename).data)
+    cycles = sorted(df_raw['cycle number'].unique())
+    summary_rows, param_rows, cycle_images = [], [], []
+    for index, cycle in enumerate(cycles):
+        if progress is not None:
+            progress(index, len(cycles), int(cycle))
+        df = df_raw[df_raw['cycle number'] == cycle]
+        f_all = df['freq/Hz'].to_numpy(dtype=float)
+        x_all = df['Re(Z)/Ohm'].to_numpy(dtype=float)
+        y_all = df['-Im(Z)/Ohm'].to_numpy(dtype=float)
+        valid = (np.isfinite(f_all) & (f_all > 0) & np.isfinite(x_all)
+                 & np.isfinite(y_all) & (np.hypot(x_all, y_all) > 0))
+        f, z = f_all[valid], x_all[valid]-1j*y_all[valid]
+        info = {'Cycle': int(cycle), 'Fit converged': False,
+                'Points fitted': int(valid.sum()), 'Tail points removed': 0,
+                'Circuit': ECM_BULK_INTERFACE}
+        summary = {'Cycle': int(cycle)}
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.scatter(x_all, y_all, color='lightgray', s=10)
+        ax.scatter(z.real, -z.imag, color='darkblue', s=10)
+        try:
+            fit = fit_ecm_spectrum(f, z, circuit_label)
+        except RuntimeError as exc:
+            summary.update(R_bulk=np.nan, R_i=np.nan, R_total=np.nan)
+            summary['Fit error (%)'] = np.nan
+            info.update({'Fit error (%)': np.nan, 'Fit note': str(exc)})
+            ax.plot([], [], ' ', label='Fit unavailable')
+        else:
+            p = fit['params']
+            rb, qb, nb, ri, qi, ni, qt, nt = p
+            error = 100*np.sqrt(np.mean(abs((fit['predict'](f)-z)/abs(z))**2))
+            summary.update(R_bulk=rb, R_i=ri, R_total=rb+ri)
+            summary['Fit error (%)'] = error
+            info.update({'Fit converged': True, 'Fit error (%)': error,
+                         'Fit note': '; '.join(fit['notes'])})
+            info.update(fit['diagnostics'])
+            for name, unit, value, se, initial in zip(
+                    PARAMETER_NAMES, PARAMETER_UNITS, p, fit['conf'], fit['initial']):
+                info[f'{name} ({unit})'] = value
+                info[f'{name} std. error ({unit})'] = se
+                info[f'{name} initial guess ({unit})'] = initial
+            info['R_bulk std. error (Ohm)'] = fit['conf'][0]
+            info['R_i std. error (Ohm)'] = fit['conf'][3]
+            info['C_eff,bulk (F)'] = ecm_effective_capacitance(rb, qb, nb)
+            info['C_eff,interface (F)'] = ecm_effective_capacitance(ri, qi, ni)
+            frequencies = np.geomspace(f.max(), f.min(), 500)
+            prediction = fit['predict'](frequencies)
+            units = {'Ohm': 'Ω', 'Ohm^-1 s^n': r'$\Omega^{-1}\,s^{n}$', '-': ''}
+            label = '\n'.join(f'{name} = {value:.4g} {units[unit]}'.rstrip()
+                              for name, unit, value in zip(PARAMETER_NAMES, PARAMETER_UNITS, p))
+            ax.plot(prediction.real, -prediction.imag, 'r-',
+                    label=label+f'\nFit error = {error:.2f}%')
+        finite = np.isfinite(x_all) & np.isfinite(y_all)
+        if finite.any():
+            x, y = x_all[finite], y_all[finite]
+            pad = .05*max(float(np.ptp(x)), float(np.ptp(y)), 1e-6)
+            ax.set_xlim(x.min()-pad, x.max()+pad)
+            ax.set_ylim(min(y.min(), 0)-pad, max(y.max(), 0)+pad)
+        ax.set_title(cycle_title or f'{cell_label} {run_label} Cycle {int(cycle)}')
+        ax.set_xlabel('Re(Z)/Ohm'); ax.set_ylabel('-Im(Z)/Ohm')
+        ax.set_aspect('equal')
+        ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1),
+                  title=f'ECM: {ECM_BULK_INTERFACE}', fontsize='small')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight'); buf.seek(0)
+        plt.close(fig)
+        cycle_images.append((f'{cell_label}_{run_label}_Cycle_{int(cycle)}_Fit.png', buf))
+        summary_rows.append(summary); param_rows.append(info)
+    summary_df = pd.DataFrame(summary_rows).sort_values('Cycle')
+    params_df = pd.DataFrame(param_rows).sort_values('Cycle')
+    trend, _ = plot_resistance_trend(summary_df, cell_label, run_label)
+    csv = io.StringIO()
+    summary_df.rename(columns=SUMMARY_UNITS).to_csv(csv, index=False); csv.seek(0)
+    return summary_df, params_df, trend, csv, cycle_images
+
+
+def impedance_fit(settings, cell_type, cell_label, data_filename, run_label,
+                  cycle_title=None, progress=None):
+    """Route every EIS workflow to the sole supported Qt circuit."""
+    if settings.get('technique') != 'ECM fit':
+        raise ValueError('Only the Qt equivalent circuit is available in this branch.')
+    return ecm_fit(cell_type, cell_label, data_filename, run_label,
+        settings['ecm_circuit'], settings.get('bulk_c_threshold'),
+        remove_tail=bool(settings.get('ecm_remove_tail', False)),
+        cycle_title=cycle_title, progress=progress)

@@ -2,11 +2,32 @@
 
 An interface/app for data analysis work in the Balsara Lab.
 
-Author: Hansen Yang, Zirong He    
-Last updated: October 9, 2026  
-Version: 4.5 (v4.5)  
-Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.  
+Author: Hansen Yang, Zirong He<br>
+Last updated: Nov 2, 2026<br>
+Version: 4.6 (v4.6)<br>
+Purpose: This document contains instructions to run the Python programs for data analysis. The methods of data analysis include preconditioning EIS fits, Sand's time analysis, current fraction analysis, and diffusion coefficient fitting.<br>
 Properties: This app is run locally on your computer, or on the Streamlit website. It is displayed in your default browser.
+
+## Changes in v4.6
+A genral fitting stradegy based on equivalent circuit method (ECM):
+
+ **(Rb ∥ Qb) + (Ri ∥ Qi) + Qt**.
+
+The eight fitted parameters are **Rb, Qb, nb, Ri, Qi, ni, Qt, nt**. Each parallel branch uses R / [1 + R Q (jω)^n]; the series tail uses 1 / [Qt (jω)^nt]. It uses SciPy’s least_squares optimizer.
+
+| Symbol | Meaning | Unit |
+|---|---|---|
+| Rb | Resistance of the branch assigned to bulk electrolyte | Ω |
+| Qb | CPE coefficient of the bulk branch | Ω⁻¹ sⁿᵇ |
+| nb | Exponent describing the bulk CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Ri | Resistance of the branch assigned to the interface | Ω |
+| Qi | CPE coefficient of the interface branch | Ω⁻¹ sⁿⁱ |
+| ni | Exponent describing the interface CPE’s departure from ideal capacitive behaviour | Dimensionless |
+| Qt | CPE coefficient used to describe the low-frequency tail | Ω⁻¹ sⁿᵗ |
+| nt | Exponent controlling the tail’s frequency dependence and angle | Dimensionless |
+| ∥ | Elements connected in parallel | — |
+| + | Elements connected in series | — |
+
 
 ## Changes in v4.5
 
@@ -71,28 +92,28 @@ The two main changes are the metadata file and the checks for empty and unreadab
 
 ## Description of Files
 
-1. `app.py`  
+1. `app.py`<br>
    The program that displays the interface for data analysis. Responsible for the UI of the app.
 
-2. `plotting.py`  
+2. `plotting.py`<br>
    The mathematical workhorse of the application. Performs the electrochemical analysis.
 
-3. `validation.py`  
+3. `validation.py`<br>
    Checks each uploaded `.mpr` file. Finds files that are empty, files that `galvani` cannot read, and files that do not have the necessary data columns.
 
-4. `ElectroSmart.bat`  
+4. `ElectroSmart.bat`<br>
    Windows launcher. It installs dependencies, creates a Desktop shortcut, opens the browser, and runs the Streamlit app.
 
-5. `requirements.txt`  
+5. `requirements.txt`<br>
    Required Python libraries needed to run ElectroSmart.
 
-6. `Logo.ico`  
+6. `Logo.ico`<br>
    Display icon for the Windows shortcut.
 
-7. `Logo.png`  
+7. `Logo.png`<br>
    ElectroSmart logo image.
 
-8. `.gitignore`  
+8. `.gitignore`<br>
    Prevents virtual environments, Python cache files, and local Streamlit folders from being committed to GitHub.
 
 ## Libraries and Packages Needed

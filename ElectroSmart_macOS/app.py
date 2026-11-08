@@ -8,11 +8,13 @@ from galvani import BioLogic
 from PIL import Image
 import base64
 from datetime import datetime, timedelta, timezone
-from typing import Any, IO, Optional
+from typing import Any, Callable, IO, Optional
 
 from plotting import (
     plot_all_EIS_precond,
-    semiellipse_fit,
+    impedance_fit,
+    ECM_BULK_INTERFACE,
+    SUMMARY_UNITS,
     get_current_from_mpr,
     plot_cp_ewe,
     analyze_sand_and_polarization,
@@ -35,65 +37,88 @@ from validation import (
     inspect_mpr_file,
 )
 
-version = 4.5
+version = "4.8-qt-only"
 
 logo_path = os.path.join(os.path.dirname(__file__), "Logo.png")
 icon = Image.open(logo_path)
 with open(logo_path, "rb") as f:
     logo_b64 = base64.b64encode(f.read()).decode()
 
+def impedance_fit_label(key: str) -> str:
+    """Show the fixed circuit used in every EIS workflow."""
+    st.markdown('**Circuit: (Rb ∥ Qb) + (Ri ∥ Qi) + Qt**')
+    st.image(os.path.join(os.path.dirname(__file__), 'circuit_qt.svg'), width='stretch')
+    return 'ECM fit'
+
+
+def get_fit_settings(technique: str, key_prefix: str) -> dict[str, Any]:
+    """Use the same whole-spectrum Qt fit in every workflow."""
+    return {'technique': 'ECM fit', 'ecm_circuit': ECM_BULK_INTERFACE,
+            'ecm_remove_tail': False, 'bulk_c_threshold': None}
+
+
+def eis_fit_metadata(settings: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Record the exact model and solver in exported analysis metadata."""
+    return [
+        ('Technique', 'ECM fit'), ('Circuit', ECM_BULK_INTERFACE),
+        ('Assignment', 'R_bulk = Rb (higher-frequency branch); R_i = Ri; model assumption'),
+        ('Series resistor', 'None'), ('Capacitance cutoff', 'Not used'),
+        ('Points', 'All finite, nonzero impedance points with positive frequency; no tail removal'),
+        ('Weighting', 'Complex residuals divided by measured |Z|'),
+        ('Optimizer', 'SciPy least_squares TRF; log-positive parameters; 36 deterministic starts per cycle; seed 20261101; no warm start'),
+        ('Bounds', 'R: 1e-6 to 1e10 Ohm; Q: 1e-18 to 1 Ohm^-1 s^n; nb/ni: 0.3 to 1; nt: 0.05 to 1'),
+        ('Tolerances', 'ftol = xtol = gtol = 1e-9; max_nfev = 2500'),
+        ('Uncertainty', 'Local errors conditional on model; unavailable for rank deficiency, parameters at bounds, or Q/n of arcs with unmeasured peaks; start spread is not a confidence interval'),
+        ('Interpretation', 'Qt near nt=0.05 is nearly resistive; branch labels alone do not establish physical bulk/interface identity'),
+    ]
+
+
 # --- Helper Functions ---
-def get_discard_parameters() -> tuple[int, int]:
-    """Show number inputs for the left and right discard counts.
-
-    Returns:
-        The left discard count and the right discard count.
-    """
-    col1, col2 = st.columns(2)
-    with col1:
-        left = st.number_input(
-            "Points to discard (left):", min_value=0, value=2, key="left_input"
-        )
-    with col2:
-        right = st.number_input(
-            "Points to discard (right):", min_value=0, value=2, key="right_input"
-        )
-    return left, right
 
 
-def single_or_dual_ellipse(key: Optional[str] = None) -> str:
-    """Show a radio button to choose the ellipse fit mode.
+def fit_progress_bar(label: str) -> tuple[Callable[[int, int, int], None], Any]:
+    """Show a progress bar for the impedance fit of one PEIS file.
 
     Args:
-        key: A unique Streamlit widget key.
+        label: The text before the cycle number, for example
+            "Positive PEIS (file.mpr)".
 
     Returns:
-        The chosen fit mode label.
+        A function for the progress argument of impedance_fit, and the
+        progress bar. Call empty() on the bar after the fit.
     """
-    return st.radio(
-        "Fit Choice:",
-        ["Single Ellipse", "Two Ellipse (Recommended)", "Single/Two Ellipse"],
-        horizontal=True,
-        index=1,
-        key=key,
-    )
+    bar = st.progress(0.0, text=f"{label}: reading the file")
+
+    def update(done: int, total: int, cycle: int) -> None:
+        bar.progress(
+            done / total, text=f"{label}: fitting cycle {cycle} ({done + 1} of {total})"
+        )
+
+    return update, bar
 
 
-def impedance_technique_radio(key: str) -> str:
-    """Show a radio button to choose the impedance fit technique.
+def show_params_table(df: pd.DataFrame) -> None:
+    """Show an ECM fit parameter table with 4 significant digits.
+
+    The table has values from about 1e-12 (Q) to 1e5 (R). The default
+    format shows small values as 0. The CSV keeps the full precision.
 
     Args:
-        key: A unique Streamlit widget key.
+        df: The ECM fit parameter dataframe.
 
     Returns:
-        The chosen technique label.
+        None.
     """
-    return st.radio(
-        "Technique:",
-        ["Linear fit", "Semi-ellipse fit"],
-        horizontal=True,
-        index=1,
-        key=key,
+    parameter_names = {"Rb", "Qb", "nb", "Ri", "Qi", "ni", "Qt", "nt"}
+    columns = [c for c in df.columns
+               if c in {"Cycle", "Run", "Fit error (%)"}
+               or c.split(" (")[0] in parameter_names]
+    df = df.loc[:, columns]
+    float_cols = df.select_dtypes(include="float").columns
+    st.dataframe(
+        df.style.format({col: "{:.4g}" for col in float_cols}, na_rep=""),
+        width="stretch",
+        hide_index=True,
     )
 
 
@@ -343,13 +368,11 @@ def fit_current_fraction_eis_resistances(
     cell_label: str,
     pos_eis_file: IO[bytes],
     neg_eis_file: IO[bytes],
-    discard_left: int,
-    discard_right: int,
-    fit_choice: str,
-) -> tuple[dict[str, list[float]], pd.DataFrame]:
+    settings: dict[str, Any],
+) -> tuple[dict[str, list[float]], pd.DataFrame, Optional[pd.DataFrame]]:
     """Fit R_bulk and R_i from the positive and negative PEIS files.
 
-    Fit each PEIS file with the semi-ellipse method. Use the first
+    Fit each PEIS file with the technique in the settings. Use the first
     cycle as the initial resistance and the last cycle as the
     steady-state resistance.
 
@@ -357,31 +380,27 @@ def fit_current_fraction_eis_resistances(
         cell_label: The label of the cell under test.
         pos_eis_file: The positive polarity PEIS file object.
         neg_eis_file: The negative polarity PEIS file object.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-        fit_choice: The chosen ellipse fit mode.
+        settings: The fit settings. See get_fit_settings.
 
     Returns:
-        A dictionary of fitted resistances, and a combined fit table
-        dataframe.
+        A dictionary of fitted resistances, a combined fit table
+        dataframe, and a combined ECM fit parameter dataframe (None for
+        failed fits). The fit table has units in the column
+        names.
     """
     resistances = {}
     fit_tables = []
+    param_tables = []
 
     for resistance_key, run_label, f_obj in [
         ("R_pos", "Positive", pos_eis_file),
         ("R_neg", "Negative", neg_eis_file),
     ]:
-        fit_df, trend_buf, _, _ = semiellipse_fit(
-            "Current Fraction",
-            cell_label,
-            discard_left,
-            discard_right,
-            f_obj,
-            run_label,
-            fit_choice == "Two Ellipse (Recommended)",
-            fit_choice == "Single Ellipse",
+        update, bar = fit_progress_bar(f"{run_label} PEIS ({f_obj.name})")
+        fit_df, params_df, trend_buf, _, _ = impedance_fit(
+            settings, "Current Fraction", cell_label, f_obj, run_label, progress=update
         )
+        bar.empty()
         fit_df = fit_df.sort_values("Cycle").reset_index(drop=True)
         first_cycle = fit_df.iloc[0]
         last_cycle = fit_df.iloc[-1]
@@ -396,9 +415,16 @@ def fit_current_fraction_eis_resistances(
         fit_table = fit_df.copy()
         fit_table.insert(0, "Polarity", run_label)
         fit_table["EIS File"] = f_obj.name
+        fit_table = fit_table.rename(columns=SUMMARY_UNITS)
+        if params_df is not None:
+            param_table = params_df.copy()
+            param_table.insert(0, "Polarity", run_label)
+            param_table["EIS File"] = f_obj.name
+            param_tables.append(param_table)
         fit_tables.append(fit_table)
 
-    return resistances, pd.concat(fit_tables, ignore_index=True)
+    params_all = pd.concat(param_tables, ignore_index=True) if param_tables else None
+    return resistances, pd.concat(fit_tables, ignore_index=True), params_all
 
 
 def analysis_time_text() -> str:
@@ -456,11 +482,11 @@ def build_metadata_text(
         current_metadata_text adds the uploaded files and the warnings
         at download.
     """
-    title = "ElectroSmart Analysis Metadata"
+    title = "Zirong-ECM Analysis Metadata"
     lines = [
         title,
         "=" * len(title),
-        f"ElectroSmart Version: {version}",
+        f"Zirong-ECM Version: {version}",
         f"Analysis: {analysis}",
         f"Time of Analysis: {analysis_time_text()}",
         f"Cell Type: {cell_type}",
@@ -472,30 +498,6 @@ def build_metadata_text(
         lines += ["", section_title, "-" * len(section_title)]
         lines += [f"{name}: {value}" for name, value in entries]
     return "\r\n".join(lines) + "\r\n"
-
-
-def eis_fit_metadata(
-    technique: str, fit_choice: str, discard_left: int, discard_right: int
-) -> list[tuple[str, Any]]:
-    """List the EIS fit settings for a metadata file.
-
-    Give the value of each EIS fit widget. Do not add other text.
-
-    Args:
-        technique: The chosen impedance fit technique.
-        fit_choice: The chosen ellipse fit mode.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-
-    Returns:
-        A list of (name, value) pairs.
-    """
-    return [
-        ("Technique", technique),
-        ("Points to discard (left)", int(discard_left)),
-        ("Points to discard (right)", int(discard_right)),
-        ("Fit Choice", fit_choice),
-    ]
 
 
 def current_metadata_text(meta_key: str) -> str:
@@ -612,6 +614,11 @@ def build_eis_analysis_zip(key_list: list[str]) -> bytes:
                 )
                 for fname, buf in st.session_state[f"fit_cycles_{key}"]:
                     zf.writestr(f"{key}_{fname}", buf.getvalue())
+            if f"fit_params_{key}" in st.session_state:
+                zf.writestr(
+                    f"{key}_ECM_fit_parameters.csv",
+                    st.session_state[f"fit_params_{key}"].to_csv(index=False),
+                )
 
     return zip_buf.getvalue()
 
@@ -621,11 +628,9 @@ def run_eis_analysis(
     cell_label: str,
     mpr_files: list[IO[bytes]],
     selections: dict[str, str],
-    discard_left: int,
-    discard_right: int,
-    fit_choice: str,
+    settings: dict[str, Any],
 ) -> None:
-    """Run the EIS overview plot and the semi-ellipse fit for each
+    """Run the EIS overview plot and the impedance fit for each
     selected file.
 
     Store each result in session state under the matching key in
@@ -638,9 +643,7 @@ def run_eis_analysis(
         mpr_files: A list of all uploaded MPR file objects.
         selections: A dictionary that maps each result key to a file
             name.
-        discard_left: The number of points to discard from the left.
-        discard_right: The number of points to discard from the right.
-        fit_choice: The chosen ellipse fit mode.
+        settings: The fit settings. See get_fit_settings.
 
     Returns:
         None. Store all results in session state.
@@ -652,16 +655,17 @@ def run_eis_analysis(
         st.session_state[f"data_{key}"] = img_buf
         st.session_state[f"fname_{key}"] = f"{cell_label}_{key}_Plot.png"
 
-        df, sum_fig, csv_data, cyc_imgs = semiellipse_fit(
-            cell_type,
-            cell_label,
-            discard_left,
-            discard_right,
-            f_obj,
-            key,
-            fit_choice == "Two Ellipse (Recommended)",
-            fit_choice == "Single Ellipse",
+        update, bar = fit_progress_bar(f"{key} PEIS ({fname})")
+        df, params_df, sum_fig, csv_data, cyc_imgs = impedance_fit(
+            settings, cell_type, cell_label, f_obj, key, progress=update
         )
+        bar.empty()
+        # Show the summary with units in the column names.
+        df = df.rename(columns=SUMMARY_UNITS)
+        if params_df is not None:
+            st.session_state[f"fit_params_{key}"] = params_df
+        else:
+            st.session_state.pop(f"fit_params_{key}", None)
         st.session_state[f"fit_df_{key}"] = df
         st.session_state[f"fit_fig_{key}"] = sum_fig
         st.session_state[f"fit_csv_{key}"] = csv_data
@@ -739,8 +743,20 @@ def display_eis_analysis(
                     continue
                 st.subheader(f"{key} Fit")
                 st.image(st.session_state[f"fit_fig_{key}"])
+                st.dataframe(st.session_state[f"fit_df_{key}"], width="stretch", hide_index=True)
 
-                c_dl1, c_dl2 = st.columns(2)
+                has_params = f"fit_params_{key}" in st.session_state
+                if has_params:
+                    c_dl1, c_dl2, c_dl3 = st.columns(3)
+                    c_dl3.download_button(
+                        f"ECM Parameters CSV ({key})",
+                        st.session_state[f"fit_params_{key}"].to_csv(index=False),
+                        f"{key}_ECM_fit_parameters.csv",
+                        "text/csv",
+                        key=f"btn_ecm_params_{key}",
+                    )
+                else:
+                    c_dl1, c_dl2 = st.columns(2)
                 c_dl1.download_button(
                     f"CSV ({key})",
                     st.session_state[f"fit_csv_{key}"].getvalue(),
@@ -751,6 +767,10 @@ def display_eis_analysis(
                     st.session_state[f"fit_fig_{key}"].getvalue(),
                     f"{key}_trend.png",
                 )
+
+                if has_params:
+                    st.write(f"**ECM Fit Parameters ({key})**")
+                    show_params_table(st.session_state[f"fit_params_{key}"])
 
                 with st.expander(f"Individual Cycle Plots ({key})"):
                     for fname, img_buf in st.session_state[f"fit_cycles_{key}"]:
@@ -796,6 +816,11 @@ def build_limiting_impedance_zip(
                 zf.writestr(
                     st.session_state["fname_csv_LC_PEIS_all"],
                     st.session_state["peis_summary_all"].to_csv(index=False),
+                )
+            if "peis_params_all" in st.session_state:
+                zf.writestr(
+                    f"{cell_label}_ECM_fit_parameters.csv",
+                    st.session_state["peis_params_all"].to_csv(index=False),
                 )
 
         if include_individual and "lim_bundles_peis" in st.session_state:
@@ -881,12 +906,12 @@ def display_limiting_current_runs(bundles: list[dict[str, Any]]) -> None:
 
 # --- Main App ---
 st.set_page_config(
-    page_title="ElectroSmart",
+    page_title="Zirong-ECM",
     page_icon=icon,
     layout="wide",
     menu_items={
         "Report a bug": "https://github.com/hansenryang/electrosmart/issues",
-        "About": (f"ElectroSmart v{version} — Balsara Lab, UC Berkeley\n\n"
+        "About": (f"Zirong-ECM v{version} — based on ElectroSmart, Balsara Lab, UC Berkeley\n\n"
                   "**Contact:** hansenry@berkeley.edu, zironghe@berkeley.edu\n\n"
                   "**Acknowledgements & Credits:** \n - If this software contributes to any " 
                   "publications outside the Balsara Lab, please acknowledge the Balsara Lab, University of California, Berkeley.\n\n"
@@ -988,13 +1013,13 @@ st.markdown(
     f"""
     <div style="display:flex; align-items:flex-end; gap:12px;">
         <img src="data:image/png;base64,{logo_b64}" style="height:48px; margin-bottom:4px;">
-        <h1 style="margin:0; padding:0;">ElectroSmart</h1>
+        <h1 style="margin:0; padding:0;">Zirong-ECM</h1>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.caption("*Check the ⋮ menu (top right) for app info and acknowledgements.*")
+st.caption("Qt circuit edition · (Rb ∥ Qb) + (Ri ∥ Qi) + Qt")
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
@@ -1106,14 +1131,10 @@ if cell_type and cell_label and uploaded_files:
 
         st.divider()
 
-        tech = impedance_technique_radio("single_impedance_technique")
+        tech = impedance_fit_label("single_impedance_technique")
 
-        if tech == "Linear fit":
-            show_warning("This technique is not yet supported.")
-
-        if tech == "Semi-ellipse fit":
-            discard_left, discard_right = get_discard_parameters()
-            fit_choice = single_or_dual_ellipse("single_fit_choice")
+        if tech == "ECM fit":
+            fit_settings = get_fit_settings(tech, "single")
 
             if st.button("Generate EIS Plots", key="single_generate_button"):
                 with st.spinner(
@@ -1124,9 +1145,7 @@ if cell_type and cell_label and uploaded_files:
                         cell_label,
                         mpr_files,
                         selections,
-                        discard_left,
-                        discard_right,
-                        fit_choice,
+                        fit_settings,
                     )
                     st.session_state["fit_meta_single"] = build_metadata_text(
                         "EIS Fit (Single File)",
@@ -1136,9 +1155,7 @@ if cell_type and cell_label and uploaded_files:
                             ("Files Used in This Analysis", [("PEIS File", single_peis_name)]),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    tech, fit_choice, discard_left, discard_right
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )
@@ -1193,14 +1210,10 @@ if cell_type and cell_label and uploaded_files:
 
             selections = {"Positive": pos_peis_name, "Negative": neg_peis_name}
             st.divider()
-            tech = impedance_technique_radio("preconditioning_impedance_technique")
+            tech = impedance_fit_label("preconditioning_impedance_technique")
 
-            if tech == "Linear fit":
-                show_warning("This technique is not yet supported.")
-
-            if tech == "Semi-ellipse fit":
-                discard_left, discard_right = get_discard_parameters()
-                fit_choice = single_or_dual_ellipse("preconditioning_fit_choice")
+            if tech == "ECM fit":
+                fit_settings = get_fit_settings(tech, "preconditioning")
 
                 generate_col, metadata_col, _ = st.columns([1, 1, 3])
                 if generate_col.button(
@@ -1214,9 +1227,7 @@ if cell_type and cell_label and uploaded_files:
                             cell_label,
                             mpr_files,
                             selections,
-                            discard_left,
-                            discard_right,
-                            fit_choice,
+                            fit_settings,
                         )
                         st.session_state["fit_meta_precond"] = build_metadata_text(
                             "Preconditioning",
@@ -1232,9 +1243,7 @@ if cell_type and cell_label and uploaded_files:
                                 ),
                                 (
                                     "EIS Fitting",
-                                    eis_fit_metadata(
-                                        tech, fit_choice, discard_left, discard_right
-                                    ),
+                                    eis_fit_metadata(fit_settings),
                                 ),
                             ],
                         )
@@ -1309,6 +1318,17 @@ if cell_type and cell_label and uploaded_files:
         st.divider()
         st.write("#### B. Potentiometric Data")
 
+        auto_detect_plateau = st.checkbox(
+            "Auto-detect plateau",
+            value=True,
+            key="lim_auto_detect_plateau",
+            help=(
+                "If checked, the app reports the steady-state voltage only for "
+                "the runs that do not diverge. If unchecked, the app reports "
+                "the steady-state voltage for all runs."
+            ),
+        )
+
         if st.button("Process Potentiometric Data", disabled=not pot_bundles):
             with st.spinner("Analyzing Potentiometric Data ..."):
                 confirmed_bundles, cp_summaries, _ = prepare_limiting_current_runs(
@@ -1323,7 +1343,9 @@ if cell_type and cell_label and uploaded_files:
                     cell_label, elyt_thickness, cp_summaries
                 )
                 st.session_state["img_all_CP"] = cp_plot_buf
-                s_df, p_df = analyze_sand_and_polarization(cp_summaries)
+                s_df, p_df = analyze_sand_and_polarization(
+                    cp_summaries, auto_detect_plateau
+                )
                 st.session_state["sands_df"] = s_df
                 st.session_state["fname_sands_csv"] = f"{cell_label}_sands_time.csv"
                 st.session_state["polarization_df"] = p_df
@@ -1350,6 +1372,7 @@ if cell_type and cell_label and uploaded_files:
                 pot_inputs = [
                     ("Active Area (cm^2)", active_area),
                     ("Electrolyte Thickness (cm)", elyt_thickness),
+                    ("Auto-detect Plateau", auto_detect_plateau),
                 ]
                 if not s_df.empty:
                     pot_inputs.append(("Diffusion Coefficient (cm^2/s)", diff_coeff))
@@ -1475,36 +1498,39 @@ if cell_type and cell_label and uploaded_files:
         st.divider()
         st.write("#### C. Impedance Data")
 
-        tech = impedance_technique_radio("limiting_current_impedance_technique")
+        tech = impedance_fit_label("limiting_current_impedance_technique")
 
-        if tech == "Linear fit":
-            show_warning("This technique is not yet supported.")
+        if tech == "ECM fit":
 
-        if tech == "Semi-ellipse fit":
-
-            discard_left, discard_right = get_discard_parameters()
-            fit_choice = single_or_dual_ellipse("limiting_current_fit_choice")
+            fit_settings = get_fit_settings(tech, "limiting_current")
 
             if st.button("Process Impedance Data", disabled=not imp_bundles):
                 with st.spinner("Analyzing Impedance Data ..."):
                     peis_results = []
+                    peis_params = []
                     all_peis_raw_data = []
 
-                    for b in imp_bundles:
+                    run_bar = st.progress(0.0)
+                    for run_index, b in enumerate(imp_bundles):
+                        run_bar.progress(
+                            run_index / len(imp_bundles),
+                            text=(
+                                f"Fitting Run {b['run_no']} "
+                                f"({run_index + 1} of {len(imp_bundles)}): "
+                                f"{b['f_peis'].name}"
+                            ),
+                        )
                         b["f_peis"].seek(0)
                         mpr_peis = BioLogic.MPRfile(b["f_peis"])
                         df_peis_raw = pd.DataFrame(mpr_peis.data)
                         df_peis_raw["density"] = b["Current Density (mA/cm²)"]
                         all_peis_raw_data.append(df_peis_raw)
 
-                        fit_img_buf, fit_df, fit_csv = plot_limiting_peis_fit(
+                        fit_img_buf, fit_df, params_df, fit_csv = plot_limiting_peis_fit(
                             b["f_peis"],
                             cell_label,
                             f"Run {b['run_no']}",
-                            discard_left,
-                            discard_right,
-                            fit_choice == "Two Ellipse (Recommended)",
-                            fit_choice == "Single Ellipse",
+                            fit_settings,
                             b["Current Density (mA/cm²)"],
                         )
                         b["fig_peis"] = fit_img_buf
@@ -1513,22 +1539,37 @@ if cell_type and cell_label and uploaded_files:
                         fit_df["Run_no"] = b["run_no"]
                         fit_df["Current (mA/cm^2)"] = round(dens, 3)
                         fit_df["R_bulk + R_i"] = fit_df["R_bulk"] + fit_df["R_i"]
-                        fit_df = fit_df[
-                            [
-                                "Run_no",
-                                "Current (mA/cm^2)",
-                                "R_bulk",
-                                "R_i",
-                                "R_bulk + R_i",
-                            ]
+                        # Export nominal branch resistances and the fit error.
+                        lc_columns = [
+                            "Run_no",
+                            "Current (mA/cm^2)",
+                            "R_bulk",
+                            "R_i",
+                            "R_bulk + R_i",
+                            "R_bulk_arc",
+                            "R_i_arc",
+                            "Fit error (%)",
                         ]
+                        fit_df = fit_df[[c for c in lc_columns if c in fit_df.columns]]
+                        fit_df = fit_df.rename(columns=SUMMARY_UNITS)
+                        if params_df is not None:
+                            params_df.insert(0, "Run_no", b["run_no"])
+                            params_df.insert(1, "Current (mA/cm^2)", round(dens, 3))
+                            peis_params.append(params_df)
                         peis_results.append(fit_df)
 
+                    run_bar.empty()
                     peis_raw_combined = pd.concat(all_peis_raw_data)
                     st.session_state["lim_bundles_peis"] = imp_bundles
                     st.session_state["peis_summary_all"] = pd.concat(
                         peis_results, ignore_index=True
                     )
+                    if peis_params:
+                        st.session_state["peis_params_all"] = pd.concat(
+                            peis_params, ignore_index=True
+                        )
+                    else:
+                        st.session_state.pop("peis_params_all", None)
                     st.session_state["fname_csv_LC_PEIS_all"] = (
                         f"{cell_label}_all_PEIS_fits.csv"
                     )
@@ -1590,9 +1631,7 @@ if cell_type and cell_label and uploaded_files:
                             ),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    tech, fit_choice, discard_left, discard_right
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )
@@ -1620,11 +1659,30 @@ if cell_type and cell_label and uploaded_files:
 
                 # --- Display CSV Contents ---
                 st.write("#### Fit Summary Data")
-                st.dataframe(st.session_state["peis_summary_all"], width="stretch")
+                st.dataframe(
+                    st.session_state["peis_summary_all"], width="stretch", hide_index=True
+                )
+
+                has_params = "peis_params_all" in st.session_state
+                if has_params:
+                    st.write("#### ECM Fit Parameters")
+                    show_params_table(st.session_state["peis_params_all"])
 
                 peis_all_df = st.session_state["peis_summary_all"]
 
-                c1, c2, c3, c4 = st.columns(4)
+                # Put the ECM parameter CSV next to the summary CSV. Put the
+                # metadata button last.
+                if has_params:
+                    c1, c2, c_params, c3, c4 = st.columns(5)
+                    c_params.download_button(
+                        f"Download {cell_label} ECM fit parameters (CSV)",
+                        st.session_state["peis_params_all"].to_csv(index=False),
+                        f"{cell_label}_ECM_fit_parameters.csv",
+                        "text/csv",
+                        key="btn_lc_ecm_params",
+                    )
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
 
                 metadata_download_button(
                     "lim_meta_peis",
@@ -1667,7 +1725,7 @@ if cell_type and cell_label and uploaded_files:
                                 with st.expander(
                                     f"Run {b['run_no']}: {b['Current Density (mA/cm²)']:.3f} mA/cm²"
                                 ):
-                                    st.write("**PEIS Semi-ellipse Fit**")
+                                    st.write("**PEIS Fit**")
                                     if b["fig_peis"]:
                                         st.image(b["fig_peis"])
 
@@ -1743,8 +1801,8 @@ if cell_type and cell_label and uploaded_files:
                 "Please select a distinct file for each polarity."
             )
 
-        discard_left, discard_right = get_discard_parameters()
-        fit_choice = single_or_dual_ellipse("current_fraction_fit_choice")
+        cf_tech = impedance_fit_label("current_fraction_impedance_technique")
+        fit_settings = get_fit_settings(cf_tech, "current_fraction")
 
         st.write("#### Uploaded CA/OCV MPR Files")
         st.dataframe(pd.DataFrame({"File": [f.name for f in cf_run_files]}), width="stretch")
@@ -1754,13 +1812,11 @@ if cell_type and cell_label and uploaded_files:
             neg_eis_file = next(f for f in eis_files if f.name == neg_eis_name)
             with st.spinner("Analyzing Current Fraction MPR files..."):
                 try:
-                    resistances, eis_fit_df = fit_current_fraction_eis_resistances(
+                    resistances, eis_fit_df, eis_params_df = fit_current_fraction_eis_resistances(
                         cell_label,
                         pos_eis_file,
                         neg_eis_file,
-                        discard_left,
-                        discard_right,
-                        fit_choice,
+                        fit_settings,
                     )
                     summary_df, raw_df, plot_buf, avg_rho = analyze_current_fraction_mpr(
                         cf_run_files, resistances, int(avg_points), iss_method
@@ -1774,6 +1830,10 @@ if cell_type and cell_label and uploaded_files:
                         summary_df.to_excel(writer, sheet_name="Summary", index=False)
                         raw_df.to_excel(writer, sheet_name="Raw_Data", index=False)
                         eis_fit_df.to_excel(writer, sheet_name="EIS_Fits", index=False)
+                        if eis_params_df is not None:
+                            eis_params_df.to_excel(
+                                writer, sheet_name="ECM_Fit_Parameters", index=False
+                            )
                     excel_buf.seek(0)
 
 
@@ -1806,12 +1866,7 @@ if cell_type and cell_label and uploaded_files:
                             ),
                             (
                                 "EIS Fitting",
-                                eis_fit_metadata(
-                                    "Semi-ellipse fit",
-                                    fit_choice,
-                                    discard_left,
-                                    discard_right,
-                                ),
+                                eis_fit_metadata(fit_settings),
                             ),
                         ],
                     )
@@ -1824,10 +1879,19 @@ if cell_type and cell_label and uploaded_files:
                             f"{cell_label}_current_fraction_eis_fits.csv",
                             eis_fit_df.to_csv(index=False),
                         )
+                        if eis_params_df is not None:
+                            zf.writestr(
+                                f"{cell_label}_current_fraction_ECM_fit_parameters.csv",
+                                eis_params_df.to_csv(index=False),
+                            )
 
                     st.session_state["cf_summary_df"] = summary_df
                     st.session_state["cf_raw_df"] = raw_df
                     st.session_state["cf_eis_fit_df"] = eis_fit_df
+                    if eis_params_df is not None:
+                        st.session_state["cf_eis_params_df"] = eis_params_df
+                    else:
+                        st.session_state.pop("cf_eis_params_df", None)
                     st.session_state["cf_plot_buf"] = plot_buf
                     st.session_state["cf_csv"] = csv_buf.getvalue().encode("utf-8")
                     st.session_state["cf_excel"] = excel_buf.getvalue()
@@ -1859,6 +1923,9 @@ if cell_type and cell_label and uploaded_files:
             if "cf_eis_fit_df" in st.session_state:
                 st.write("#### EIS Fit Resistances")
                 st.dataframe(st.session_state["cf_eis_fit_df"], width="stretch")
+            if "cf_eis_params_df" in st.session_state:
+                st.write("#### ECM Fit Parameters")
+                show_params_table(st.session_state["cf_eis_params_df"])
 
             d1, d2, d3, d4, d5 = st.columns(5)
             metadata_download_button(
